@@ -1,5 +1,5 @@
-/* Lisp Badge LE - uLisp 4.4
-   David Johnson-Davies - www.technoblogy.com - 27th September 2023
+/* Lisp Badge LE - uLisp 4.4a
+   David Johnson-Davies - www.technoblogy.com - 5th March 2024
 
    Licensed under the MIT license: https://opensource.org/licenses/MIT
 */
@@ -1369,7 +1369,7 @@ object *apropos (object *arg, bool print) {
       }
     }
     globals = cdr(globals);
-    if (!tstflag(NOESC)) testescape();
+    testescape();
   }
   // Built-in?
   int entries = tablesize(0) + tablesize(1);
@@ -1386,7 +1386,7 @@ object *apropos (object *arg, bool print) {
         cdr(ptr) = cons(bsymbol(i), NULL); ptr = cdr(ptr);
       }
     }
-    if (!tstflag(NOESC)) testescape();
+    testescape();
   }
   return cdr(result);
 }
@@ -2192,7 +2192,7 @@ object *sp_loop (object *args, object *env) {
       }
       args = cdr(args);
     }
-    if (!tstflag(NOESC)) testescape();
+    testescape();
   }
 }
 
@@ -5621,7 +5621,7 @@ void prin1object (object *form, pfun_t pfun) {
 }
 
 // For Lisp Badge
-volatile int WritePtr = 0, ReadPtr = 0;
+volatile int WritePtr = 0, ReadPtr = 0, LastWritePtr = 0;
 const int KybdBufSize = 333; // 42*8 - 3
 char KybdBuf[KybdBufSize];
 volatile uint8_t KybdAvailable = 0;
@@ -6074,8 +6074,9 @@ uint32_t ReadBlock (uint8_t column, uint8_t line) {
   return pix;
 }
 
-// Converts bit pattern abcdefgh into aabbccddeeffgghh
-uint16_t Stretch (uint16_t x) {
+// Converts bit pattern abcdefgh into a0b0c0d0e0f0g0h
+uint16_t Stretch (uint8_t b) {
+  uint16_t x = b;
   x = (x & 0xF0)<<4 | (x & 0x0F);
   x = (x<<2 | x) & 0x3333;
   x = (x<<1 | x) & 0x5555;
@@ -6333,7 +6334,7 @@ const char Keymap[] PROGMEM =
 // Without shift
 "1234567890\b" "qwertyuiop\n" "asdfghjkl?\e" " zxcvbnm()."
 // With shift
-"\'\"#=-+/*\\;\b" "QWERTYUIOP\n" "ASDFGHJKL?~" "?ZXCVBNM<>,"
+"\'\"#=-+/*\\;\b" "QWERTYUIOP\t" "ASDFGHJKL?~" "?ZXCVBNM<>,"
 // With meta
 "\'\"#=-+/*\\;\b" "?W!R@Y^IO%\n" "&S$FGHJKL?~" "?ZX:|BNM{},";
 
@@ -6395,6 +6396,7 @@ void keyboard (bool enable) {
   
 void ProcessKey (char c) {
   static int parenthesis = 0;
+  static bool string = false;
   if (c == 27) { setflag(ESCAPE); return; }    // Escape key
   // Undo previous parenthesis highlight
   Highlight(parenthesis, 0);
@@ -6403,7 +6405,7 @@ void ProcessKey (char c) {
   if (c == '\n') {
     pserial('\n');
     KybdAvailable = 1;
-    ReadPtr = 0;
+    ReadPtr = 0; LastWritePtr = WritePtr;
     return;
   }
   if (c == 8) {     // Backspace key
@@ -6411,18 +6413,23 @@ void ProcessKey (char c) {
       WritePtr--;
       Display(0x7F);
       if (WritePtr) c = KybdBuf[WritePtr-1];
-    }
+    } 
+  } else if (c == 9) { // tab or ctrl-I
+    for (int i = 0; i < LastWritePtr; i++) Display(KybdBuf[i]);
+    WritePtr = LastWritePtr;
   } else if (WritePtr < KybdBufSize) {
+    if (c == '"') string = !string;
     KybdBuf[WritePtr++] = c;
     Display(c);
   }
   // Do new parenthesis highlight
-  if (c == ')') {
-    int search = WritePtr-1, level = 0;
+  if (c == ')' && !string) {
+    int search = WritePtr-1, level = 0, string2 = false;
     while (search >= 0 && parenthesis == 0) {
       c = KybdBuf[search--];
-      if (c == ')') level++;
-      if (c == '(') {
+      if (c == '"') string2 = !string2;
+      if (c == ')' && !string2) level++;
+      if (c == '(' && !string2) {
         level--;
         if (level == 0) parenthesis = WritePtr-search-1;
       }
@@ -6473,7 +6480,7 @@ void setup () {
   initworkspace();
   initenv();
   initsleep();
-  pfstring(PSTR("uLisp 4.4 "), pserial); pln(pserial);
+  pfstring(PSTR("uLisp 4.4a "), pserial); pln(pserial);
 }
 
 // Read/Evaluate/Print loop
@@ -6520,14 +6527,16 @@ void loop () {
 
 void ulispreset () {
   // Come here after error
+  #if defined (serialmonitor)
   delay(100); while (Serial.available()) Serial.read();
+  #endif
   clrflag(NOESC); clrflag(ESCAPE); BreakLevel = 0;
   for (int i=0; i<TRACEMAX; i++) TraceDepth[i] = 0;
   #if defined(sdcardsupport)
   SDpfile.close(); SDgfile.close();
   #endif
   #if defined(lisplibrary)
-  if (!tstflag(LIBRARYLOADED)) { setflag(LIBRARYLOADED); loadfromlibrary(NULL); }
+  if (!tstflag(LIBRARYLOADED)) { setflag(LIBRARYLOADED); loadfromlibrary(NULL); clrflag(NOECHO); }
   #endif
   keyboard(true);
 }
