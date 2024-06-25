@@ -1,5 +1,5 @@
-/* Lisp Badge LE - uLisp 4.4a
-   David Johnson-Davies - www.technoblogy.com - 5th March 2024
+/* Lisp Badge LE - uLisp 4.6
+   David Johnson-Davies - www.technoblogy.com - 25th June 2024
 
    Licensed under the MIT license: https://opensource.org/licenses/MIT
 */
@@ -40,26 +40,7 @@ const char LispLibrary[] PROGMEM = "";
 #define OBJECTALIGNED __attribute__((aligned (4)))
 #define BUFFERSIZE 22                     /* longest builtin name + 1 */
 
-#if defined(__AVR_ATmega1284P__)
-  #include "optiboot.h"
-  #define WORKSPACESIZE (2848-SDSIZE)     /* Objects (4*bytes) */
-//  #define EEPROMSIZE 4096                 /* Bytes */
-  #define FLASHWRITESIZE 16384            /* Bytes */
-  #define CODESIZE 96                     /* Bytes <= 256 */
-  #define STACKDIFF 320
-  #define CPU_ATmega1284P
-
-#elif defined(__AVR_AVR128DA48__)
-  #include <Flash.h>
-  #define Serial Serial1
-  #define WORKSPACESIZE (2920-SDSIZE)     /* Objects (4*bytes) */
-  #define FLASHWRITESIZE 16384            /* Bytes */
-  #define CODESIZE 96                     /* Bytes <= 512 */
-  #define STACKDIFF 320
-  #define CPU_AVR128DX48
-  #define LED_BUILTIN 20
-
-#elif defined(__AVR_AVR128DB48__)         /* LispBadge LE */
+#if defined(__AVR_AVR128DA48__) || defined(__AVR_AVR128DB48__)  /* LispBadge LE */
   #include <Flash.h>
   #define WORKSPACESIZE (2800-SDSIZE)     /* Objects (4*bytes) */
   #define FLASHWRITESIZE 16384            /* Bytes */
@@ -78,13 +59,17 @@ const char LispLibrary[] PROGMEM = "";
 #define car(x)             (((object *) (x))->car)
 #define cdr(x)             (((object *) (x))->cdr)
 
-#define first(x)           (((object *) (x))->car)
-#define second(x)          (car(cdr(x)))
-#define cddr(x)            (cdr(cdr(x)))
-#define third(x)           (car(cdr(cdr(x))))
+#define first(x)           car(x)
+#define rest(x)            cdr(x)
+#define second(x)          first(rest(x))
+#define cddr(x)            cdr(cdr(x))
+#define third(x)           first(cddr(x))
 
 #define push(x, y)         ((y) = cons((x),(y)))
 #define pop(y)             ((y) = cdr(y))
+
+#define protect(y)         push((y), GCStack) 
+#define unprotect()        pop(GCStack)
 
 #define integerp(x)        ((x) != NULL && (x)->type == NUMBER)
 #define symbolp(x)         ((x) != NULL && (x)->type == SYMBOL)
@@ -105,9 +90,10 @@ const char LispLibrary[] PROGMEM = "";
 #define issp(x)            (x == ' ' || x == '\n' || x == '\r' || x == '\t')
 #define isbr(x)            (x == ')' || x == '(' || x == '"' || x == '#')
 #define longsymbolp(x)     (((x)->name & 0x03) == 0)
-#define twist(x)           ((uint16_t)((x)<<2) | (((x) & 0xC000)>>14))
-#define untwist(x)         (((x)>>2 & 0x3FFF) | ((x) & 0x03)<<14)
+#define longnamep(x)       (((x) & 0x03) == 0)
 #define arraysize(x)       (sizeof(x) / sizeof(x[0]))
+#define stringifyX(x)      #x
+#define stringify(x)       stringifyX(x)
 #define PACKEDS            17600
 #define BUILTINS           64000
 #define ENDFUNCTIONS       1536
@@ -140,6 +126,8 @@ PGM_P const streamname[] PROGMEM = {serialstream, i2cstream, spistream, sdstream
 // Typedefs
 
 typedef uint16_t symbol_t;
+typedef uint16_t builtin_t;
+typedef uint16_t chars_t;
 
 typedef struct sobject {
   union {
@@ -152,7 +140,7 @@ typedef struct sobject {
       union {
         symbol_t name;
         int integer;
-        int chars; // For strings
+        chars_t chars; // For strings
       };
     };
   };
@@ -172,11 +160,9 @@ typedef const struct {
 typedef int (*gfun_t)();
 typedef void (*pfun_t)(char);
 
-typedef uint16_t builtin_t;
-
-enum builtins: builtin_t { NIL, TEE, NOTHING, OPTIONAL, INITIALELEMENT, ELEMENTTYPE, BIT, AMPREST, LAMBDA, LET, LETSTAR,
-CLOSURE, PSTAR, QUOTE, DEFUN, DEFVAR, DEFCODE, CAR, FIRST, CDR, REST, NTH, AREF, STRINGFN, PINMODE,
-DIGITALWRITE, ANALOGREAD, ANALOGREFERENCE, REGISTER, FORMAT, 
+enum builtins: builtin_t { NIL, TEE, NOTHING, OPTIONAL, FEATURES, INITIALELEMENT, ELEMENTTYPE, TEST, BIT, AMPREST,
+LAMBDA, LET, LETSTAR, CLOSURE, PSTAR, QUOTE, DEFUN, DEFVAR, DEFCODE, EQ, CAR, FIRST, CDR, REST, NTH, AREF,
+CHAR, STRINGFN, PINMODE, DIGITALWRITE, ANALOGREAD, ANALOGREFERENCE, REGISTER, FORMAT, 
  };
 
 // Global variables
@@ -216,6 +202,14 @@ volatile uint8_t Flags = 0b00001; // PRINTREADABLY set by default
 // Forward references
 object *tee;
 void pfstring (PGM_P s, pfun_t pfun);
+
+inline symbol_t twist (builtin_t x) {
+  return (x<<2) | ((x & 0xC000)>>14);
+}
+
+inline builtin_t untwist (symbol_t x) {
+  return (x>>2 & 0x3FFF) | ((x & 0x03)<<14);
+}
 
 // Error handling
 
@@ -304,7 +298,7 @@ void initworkspace () {
 }
 
 object *myalloc () {
-  if (Freespace == 0) error2(PSTR("no room"));
+  if (Freespace == 0) { Context = NIL; error2(PSTR("no room")); }
   object *temp = Freelist;
   Freelist = cdr(Freelist);
   Freespace--;
@@ -372,7 +366,7 @@ bool eqsymbols (object *obj, char *buffer) {
   int i = 0;
   while (!(arg == NULL && buffer[i] == 0)) {
     if (arg == NULL || buffer[i] == 0) return false;
-    int test = 0, shift = 8;
+    chars_t test = 0; int shift = 8;
     for (int j=0; j<2; j++, i++) {
       if (buffer[i] == 0) break;
       test = test | buffer[i]<<shift;
@@ -406,6 +400,36 @@ object *newstring () {
   ptr->type = STRING;
   ptr->chars = 0;
   return ptr;
+}
+
+// Features
+
+const char arrays[] PROGMEM = ":arrays";
+const char doc[] PROGMEM = ":documentation";
+const char machinecode[] PROGMEM = ":machine-code";
+const char errorhandling[] PROGMEM = ":error-handling";
+
+char *copyprogmemstring (PGM_P s, char *buffer) {
+  int max = BUFFERSIZE-1;
+  int i = 0;
+  do {
+    char c = pgm_read_byte(s++);
+    buffer[i++] = c;
+    if (c == 0) break;
+  } while (i<max);
+  return buffer;
+}
+
+object *features () {
+  char buffer[BUFFERSIZE];
+  object *result = NULL;
+  push(internlong(copyprogmemstring(errorhandling, buffer)), result);
+  #if defined(CODESIZE)
+  push(internlong(copyprogmemstring(machinecode, buffer)), result);
+  #endif
+  push(internlong(copyprogmemstring(doc, buffer)), result);
+  push(internlong(copyprogmemstring(arrays, buffer)), result);
+  return result;
 }
 
 // Garbage collection
@@ -641,7 +665,11 @@ unsigned int saveimage (object *arg) {
   if (!(arg == NULL || listp(arg))) error(invalidarg, arg);
   if (FlashCheck()) error(PSTR("flash write not supported"), number(FlashCheck()));
   // Save to Flash
+  #if defined(CODESIZE)
   int bytesneeded = 10 + CODESIZE + imagesize*4;
+  #else
+  int bytesneeded = 10 + imagesize*4;
+  #endif
   if (bytesneeded > FLASHWRITESIZE) error(PSTR("image too large"), number(imagesize));
   uint32_t addr = 0;
   FlashWriteInt(&addr, (uintptr_t)arg);
@@ -798,7 +826,7 @@ void trace (symbol_t name) {
     if (TraceFn[i] == 0) { TraceFn[i] = name; TraceDepth[i] = 0; return; }
     i++;
   }
-  error2(PSTR("already tracing 3 functions"));
+  error2(PSTR("already tracing " stringify(TRACEMAX) " functions"));
 }
 
 void untrace (symbol_t name) {
@@ -942,8 +970,8 @@ boolean eq (object *arg1, object *arg2) {
   return false;
 }
 
-boolean equal (object *arg1, object *arg2) {
-  if (stringp(arg1) && stringp(arg2)) return stringcompare(cons(arg1, cons(arg2, nil)), false, false, true);
+bool equal (object *arg1, object *arg2) {
+  if (stringp(arg1) && stringp(arg2)) return (stringcompare(cons(arg1, cons(arg2, nil)), false, false, true) != -1);
   if (consp(arg1) && consp(arg2)) return (equal(car(arg1), car(arg2)) && equal(cdr(arg1), cdr(arg2)));
   return eq(arg1, arg2);
 }
@@ -1005,15 +1033,14 @@ int intpower (int base, int exp) {
 
 // Association lists
 
-object *assoc (object *key, object *list) {
-  while (list != NULL) {
-    if (improperp(list)) error(notproper, list);
-    object *pair = first(list);
-    if (!listp(pair)) error(PSTR("element is not a list"), pair);
-    if (pair != NULL && eq(key,car(pair))) return pair;
-    list = cdr(list);
+object *testargument (object *args) {
+  object *test = bsymbol(EQ);
+  if (args != NULL) {
+    if (cdr(args) == NULL) error2(PSTR("unpaired keyword"));
+    if ((isbuiltin(first(args), TEST))) test = second(args);
+    else error(PSTR("unsupported keyword"), first(args));
   }
-  return nil;
+  return test;
 }
 
 object *delassoc (object *key, object **alist) {
@@ -1223,7 +1250,7 @@ void buildstring (char ch, object **tail) {
   if (cdr(*tail) == NULL) {
     cell = myalloc(); cdr(*tail) = cell;
   } else if (((*tail)->chars & 0xFF) == 0) {
-    (*tail)->chars = (*tail)->chars | ch; return;
+    (*tail)->chars |= ch; return;
   } else {
     cell = myalloc(); car(*tail) = cell;
   }
@@ -1244,13 +1271,13 @@ object *copystring (object *arg) {
   return obj;
 }
 
-object *readstring (uint8_t delim, gfun_t gfun) {
+object *readstring (uint8_t delim, bool esc, gfun_t gfun) {
   object *obj = newstring();
   object *tail = obj;
   int ch = gfun();
   if (ch == -1) return nil;
   while ((ch != delim) && (ch != -1)) {
-    if (ch == '\\') ch = gfun();
+    if (esc && ch == '\\') ch = gfun();
     buildstring(ch, &tail);
     ch = gfun();
   }
@@ -1270,17 +1297,24 @@ int stringlength (object *form) {
   return length;
 }
 
-uint8_t nthchar (object *string, int n) {
-  object *arg = cdr(string);
+object **getcharplace (object *string, int n, int *shift) {
+  object **arg = &cdr(string);
   int top;
-  if (sizeof(int) == 4) { top = n>>2; n = 3 - (n&3); }
-  else { top = n>>1; n = 1 - (n&1); }
+  if (sizeof(int) == 4) { top = n>>2; *shift = 3 - (n&3); }
+  else { top = n>>1; *shift = 1 - (n&1); }
+  *shift = - (*shift + 2);
   for (int i=0; i<top; i++) {
-    if (arg == NULL) return 0;
-    arg = car(arg);
+    if (*arg == NULL) break;
+    arg = &car(*arg);
   }
-  if (arg == NULL) return 0;
-  return (arg->chars)>>(n*8) & 0xFF;
+  return arg;
+}
+
+uint8_t nthchar (object *string, int n) {
+  int shift;
+  object **arg = getcharplace(string, n, &shift);
+  if (*arg == NULL) return 0;
+  return (((*arg)->chars)>>((-shift-2)<<3)) & 0xFF;
 }
 
 int gstr () {
@@ -1310,20 +1344,26 @@ object *lispstring (char *s) {
   return obj;
 }
 
-bool stringcompare (object *args, bool lt, bool gt, bool eq) {
+int stringcompare (object *args, bool lt, bool gt, bool eq) {
   object *arg1 = checkstring(first(args));
   object *arg2 = checkstring(second(args));
-  arg1 = cdr(arg1);
-  arg2 = cdr(arg2);
+  arg1 = cdr(arg1); arg2 = cdr(arg2);
+  int m = 0; chars_t a = 0, b = 0;
   while ((arg1 != NULL) || (arg2 != NULL)) {
-    if (arg1 == NULL) return lt;
-    if (arg2 == NULL) return gt;
-    if (arg1->chars < arg2->chars) return lt;
-    if (arg1->chars > arg2->chars) return gt;
-    arg1 = car(arg1);
-    arg2 = car(arg2);
+    if (arg1 == NULL) return lt ? m : -1;
+    if (arg2 == NULL) return gt ? m : -1;
+    a = arg1->chars; b = arg2->chars;
+    if ((a < b && lt) || ((a > b) && gt)) {
+      m = m + sizeof(int);
+      while (a != b) { m--; a = a >> 8; b = b >> 8; }
+      return m;
+    } else if ((a < b && !lt) || ((a > b) && !gt)) return -1;
+    // if (a < b) { if (lt) {  while (a != b) { m--; a = a >> 8; b = b >> 8; } return m; } else return -1; }
+    // if (a > b) { if (gt) { m = m + sizeof(int); while (a != b) { m--; a = a >> 8; b = b >> 8; } return m; } else return -1; }
+    arg1 = car(arg1); arg2 = car(arg2);
+    m = m + sizeof(int);
   }
-  return eq;
+  if (eq) { m = m - sizeof(int); while (a != 0) { m++; a = a << 8;} return m;} else return -1;
 }
 
 object *documentation (object *arg, object *env) {
@@ -1547,17 +1587,25 @@ object **place (object *args, object *env, int *bit) {
     if (sname == sym(NTH)) {
       int index = checkinteger(eval(second(args), env));
       object *list = eval(third(args), env);
-      if (atom(list)) error(PSTR("second argument to nth is not a list"), list);
-      while (index > 0) {
+      if (atom(list)) { Context = NTH; error(PSTR("second argument is not a list"), list); }
+      int i = index;
+      while (i > 0) {
         list = cdr(list);
-        if (list == NULL) error2(PSTR("index to nth is out of range"));
-        index--;
+        if (list == NULL) { Context = NTH; error(indexrange, number(index)); }
+        i--;
       }
       return &car(list);
     }
+    if (sname == sym(CHAR)) {
+      int index = checkinteger(eval(third(args), env));
+      object *string = checkstring(eval(second(args), env));
+      object **loc = getcharplace(string, index, bit);
+      if ((*loc) == NULL || (((((*loc)->chars)>>((-(*bit)-2)<<3)) & 0xFF) == 0)) { Context = CHAR; error(indexrange, number(index)); }
+      return loc;
+    }
     if (sname == sym(AREF)) {
       object *array = eval(second(args), env);
-      if (!arrayp(array)) error(PSTR("first argument is not an array"), array);
+      if (!arrayp(array)) { Context = AREF; error(PSTR("first argument is not an array"), array); }
       return getarray(array, cddr(args), env, bit);
     }
   }
@@ -1567,8 +1615,8 @@ object **place (object *args, object *env, int *bit) {
 
 object *incfdecf (object *args, int increment, object *env) {
   int bit;
-  checkargs(args);
   object **loc = place(first(args), env, &bit);
+  if (bit < -1) error2(notanumber);
   int result = checkinteger(*loc);
   args = cdr(args);
   object *inc = (args != NULL) ? eval(first(args), env) : NULL;
@@ -1617,6 +1665,34 @@ object *cxxxr (object *args, uint8_t pattern) {
 
 // Mapping helper functions
 
+object *mapcl (object *args, object *env, bool mapl) {
+  object *function = first(args);
+  args = cdr(args);
+  object *result = first(args);
+  protect(result);
+  object *params = cons(NULL, NULL);
+  protect(params);
+  // Make parameters
+  while (true) {
+    object *tailp = params;
+    object *lists = args;
+    while (lists != NULL) {
+      object *list = car(lists);
+      if (list == NULL) {
+         unprotect(); unprotect();
+         return result;
+      }
+      if (improperp(list)) error(notproper, list);
+      object *item = mapl ? list : first(list);
+      object *obj = cons(item, NULL);
+      car(lists) = cdr(list);
+      cdr(tailp) = obj; tailp = obj;
+      lists = cdr(lists);
+    }
+    apply(function, cdr(params), env);
+  }
+}
+
 void mapcarfun (object *result, object **tail) {
   object *obj = cons(result,NULL);
   cdr(*tail) = obj; *tail = obj;
@@ -1630,13 +1706,13 @@ void mapcanfun (object *result, object **tail) {
   }
 }
 
-object *mapcarcan (object *args, object *env, mapfun_t fun) {
+object *mapcarcan (object *args, object *env, mapfun_t fun, bool maplist) {
   object *function = first(args);
   args = cdr(args);
   object *params = cons(NULL, NULL);
-  push(params,GCStack);
+  protect(params);
   object *head = cons(NULL, NULL);
-  push(head,GCStack);
+  protect(head);
   object *tail = head;
   // Make parameters
   while (true) {
@@ -1645,11 +1721,12 @@ object *mapcarcan (object *args, object *env, mapfun_t fun) {
     while (lists != NULL) {
       object *list = car(lists);
       if (list == NULL) {
-         pop(GCStack); pop(GCStack);
+         unprotect(); unprotect();
          return cdr(head);
       }
       if (improperp(list)) error(notproper, list);
-      object *obj = cons(first(list),NULL);
+      object *item = maplist ? list : first(list);
+      object *obj = cons(item, NULL);
       car(lists) = cdr(list);
       cdr(tailp) = obj; tailp = obj;
       lists = cdr(lists);
@@ -1659,117 +1736,116 @@ object *mapcarcan (object *args, object *env, mapfun_t fun) {
   }
 }
 
+object *dobody (object *args, object *env, bool star) {
+  object *varlist = first(args), *endlist = second(args);
+  object *head = cons(NULL, NULL);
+  protect(head);
+  object *ptr = head;
+  object *newenv = env;
+  while (varlist != NULL) {
+    object *varform = first(varlist);
+    object *var, *init = NULL, *step = NULL;
+    if (atom(varform)) var = varform;
+    else {
+      var = first(varform);
+      varform = cdr(varform);
+      if (varform != NULL) {  
+        init = eval(first(varform), env);
+        varform = cdr(varform);
+        if (varform != NULL) step = cons(first(varform), NULL);
+      }
+    }  
+    object *pair = cons(var, init);
+    push(pair, newenv);
+    if (star) env = newenv;
+    object *cell = cons(cons(step, pair), NULL);
+    cdr(ptr) = cell; ptr = cdr(ptr);
+    varlist = cdr(varlist);
+  }
+  env = newenv;
+  head = cdr(head);
+  object *endtest = first(endlist), *results = cdr(endlist);
+  while (eval(endtest, env) == NULL) {
+    object *forms = cddr(args);
+    while (forms != NULL) {
+    object *result = eval(car(forms), env);
+      if (tstflag(RETURNFLAG)) {
+        clrflag(RETURNFLAG);
+        return result;
+      }
+      forms = cdr(forms);
+    }
+    object *varlist = head;
+    int count = 0;
+    while (varlist != NULL) {
+      object *varform = first(varlist);
+      object *step = car(varform), *pair = cdr(varform);
+      if (step != NULL) {
+        object *val = eval(first(step), env);
+        if (star) {
+          cdr(pair) = val;
+        } else {
+          push(val, GCStack);
+          push(pair, GCStack);
+          count++;
+        }
+      } 
+      varlist = cdr(varlist);
+    }
+    while (count > 0) {
+      cdr(car(GCStack)) = car(cdr(GCStack));
+      pop(GCStack); pop(GCStack);
+      count--;
+    }
+  }
+  unprotect();
+  return eval(tf_progn(results, env), env);
+}
+
 // I2C interface for AVR platforms, uses much less RAM than Arduino Wire
 
-#if defined(CPU_ATmega328P)
-uint8_t const TWI_SDA_PIN = 18;
-uint8_t const TWI_SCL_PIN = 19;
-#elif defined(CPU_ATmega1280) || defined(CPU_ATmega2560)
-uint8_t const TWI_SDA_PIN = 20;
-uint8_t const TWI_SCL_PIN = 21;
-#elif defined(CPU_ATmega644P) || defined(CPU_ATmega1284P)
-uint8_t const TWI_SDA_PIN = 17;
-uint8_t const TWI_SCL_PIN = 16;
-#elif defined(CPU_ATmega32U4)
-uint8_t const TWI_SDA_PIN = 6;
-uint8_t const TWI_SCL_PIN = 5;
-#endif
-
-#if defined(CPU_ATmega4809) || defined(CPU_AVR128DX48)
 uint32_t const FREQUENCY = 400000L;  // Hardware I2C clock in Hz
 uint32_t const T_RISE = 300L;        // Rise time
-#else
-uint32_t const F_TWI = 400000L;  // Hardware I2C clock in Hz
-uint8_t const TWSR_MTX_DATA_ACK = 0x28;
-uint8_t const TWSR_MTX_ADR_ACK = 0x18;
-uint8_t const TWSR_MRX_ADR_ACK = 0x40;
-uint8_t const TWSR_START = 0x08;
-uint8_t const TWSR_REP_START = 0x10;
-uint8_t const I2C_READ = 1;
-uint8_t const I2C_WRITE = 0;
-#endif
 
 void I2Cinit (bool enablePullup) {
-#if defined(CPU_ATmega4809) || defined(CPU_AVR128DX48)
-  #if defined(CPU_ATmega4809)
-  if (enablePullup) {
-    pinMode(SDA, INPUT_PULLUP);
-    pinMode(SCL, INPUT_PULLUP);
-  }
-  #else
-  (void) enablePullup;
-  #endif
-  uint32_t baud = ((F_CPU/FREQUENCY) - (((F_CPU*T_RISE)/1000)/1000)/1000 - 10)/2;
-  TWI0.MBAUD = (uint8_t)baud;
-  TWI0.MCTRLA = TWI_ENABLE_bm;                                    // Enable as master, no interrupts
-  TWI0.MSTATUS = TWI_BUSSTATE_IDLE_gc;
-#else
-  TWSR = 0;                        // no prescaler
-  TWBR = (F_CPU/F_TWI - 16)/2;     // set bit rate factor
-  if (enablePullup) {
-    digitalWrite(SDA, HIGH);
-    digitalWrite(SCL, HIGH);
-  }
-#endif
+(void) enablePullup;
+uint32_t baud = ((F_CPU/FREQUENCY) - (((F_CPU*T_RISE)/1000)/1000)/1000 - 10)/2;
+TWI0.MBAUD = (uint8_t)baud;
+TWI0.MCTRLA = TWI_ENABLE_bm;                                    // Enable as master, no interrupts
+TWI0.MSTATUS = TWI_BUSSTATE_IDLE_gc;
 }
 
 int I2Cread () {
-#if defined(CPU_ATmega4809) || defined(CPU_AVR128DX48)
-  if (I2Ccount != 0) I2Ccount--;
-  while (!(TWI0.MSTATUS & TWI_RIF_bm));                           // Wait for read interrupt flag
-  uint8_t data = TWI0.MDATA;
-  // Check slave sent ACK?
-  if (I2Ccount != 0) TWI0.MCTRLB = TWI_MCMD_RECVTRANS_gc;         // ACK = more bytes to read
-  else TWI0.MCTRLB = TWI_ACKACT_NACK_gc;                          // Send NAK
-  return data;
-#else
-  if (I2Ccount != 0) I2Ccount--;
-  TWCR = 1<<TWINT | 1<<TWEN | ((I2Ccount == 0) ? 0 : (1<<TWEA));
-  while (!(TWCR & 1<<TWINT));
-  return TWDR;
-#endif
+if (I2Ccount != 0) I2Ccount--;
+while (!(TWI0.MSTATUS & TWI_RIF_bm));                           // Wait for read interrupt flag
+uint8_t data = TWI0.MDATA;
+// Check slave sent ACK?
+if (I2Ccount != 0) TWI0.MCTRLB = TWI_MCMD_RECVTRANS_gc;         // ACK = more bytes to read
+else TWI0.MCTRLB = TWI_ACKACT_NACK_gc;                          // Send NAK
+return data;
 }
 
 bool I2Cwrite (uint8_t data) {
-#if defined(CPU_ATmega4809) || defined(CPU_AVR128DX48)
-  TWI0.MCTRLB = TWI_MCMD_RECVTRANS_gc;                            // Prime transaction
-  TWI0.MDATA = data;                                              // Send data
-  while (!(TWI0.MSTATUS & TWI_WIF_bm));                           // Wait for write to complete
+TWI0.MCTRLB = TWI_MCMD_RECVTRANS_gc;                            // Prime transaction
+TWI0.MDATA = data;                                              // Send data
+while (!(TWI0.MSTATUS & TWI_WIF_bm));                           // Wait for write to complete
 
-  if (TWI0.MSTATUS & (TWI_ARBLOST_bm | TWI_BUSERR_bm)) return false; // Fails if bus error or arblost
-  return !(TWI0.MSTATUS & TWI_RXACK_bm);                          // Returns true if slave gave an ACK
-#else
-  TWDR = data;
-  TWCR = 1<<TWINT | 1 << TWEN;
-  while (!(TWCR & 1<<TWINT));
-  return (TWSR & 0xF8) == TWSR_MTX_DATA_ACK;
-#endif
+if (TWI0.MSTATUS & (TWI_ARBLOST_bm | TWI_BUSERR_bm)) return false; // Fails if bus error or arblost
+return !(TWI0.MSTATUS & TWI_RXACK_bm);                          // Returns true if slave gave an ACK
 }
 
 bool I2Cstart (uint8_t address, uint8_t read) {
-#if defined(CPU_ATmega4809) || defined(CPU_AVR128DX48)
-  TWI0.MADDR = address<<1 | read;                                 // Send START condition
-  while (!(TWI0.MSTATUS & (TWI_WIF_bm | TWI_RIF_bm)));            // Wait for write or read interrupt flag
-  if (TWI0.MSTATUS & TWI_ARBLOST_bm) {                            // Arbitration lost or bus error
-    while (!((TWI0.MSTATUS & TWI_BUSSTATE_gm) == TWI_BUSSTATE_IDLE_gc)); // Wait for bus to return to idle state
-    return false;
-  } else if (TWI0.MSTATUS & TWI_RXACK_bm) {                       // Address not acknowledged by client
-    TWI0.MCTRLB |= TWI_MCMD_STOP_gc;                              // Send stop condition
-    while (!((TWI0.MSTATUS & TWI_BUSSTATE_gm) == TWI_BUSSTATE_IDLE_gc)); // Wait for bus to return to idle state
-    return false;
-  }
-  return true;                                                    // Return true if slave gave an ACK
-#else
-  uint8_t addressRW = address<<1 | read;
-  TWCR = 1<<TWINT | 1<<TWSTA | 1<<TWEN;    // Send START condition
-  while (!(TWCR & 1<<TWINT));
-  if ((TWSR & 0xF8) != TWSR_START && (TWSR & 0xF8) != TWSR_REP_START) return false;
-  TWDR = addressRW;  // send device address and direction
-  TWCR = 1<<TWINT | 1<<TWEN;
-  while (!(TWCR & 1<<TWINT));
-  if (addressRW & I2C_READ) return (TWSR & 0xF8) == TWSR_MRX_ADR_ACK;
-  else return (TWSR & 0xF8) == TWSR_MTX_ADR_ACK;
-#endif
+TWI0.MADDR = address<<1 | read;                                 // Send START condition
+while (!(TWI0.MSTATUS & (TWI_WIF_bm | TWI_RIF_bm)));            // Wait for write or read interrupt flag
+if (TWI0.MSTATUS & TWI_ARBLOST_bm) {                            // Arbitration lost or bus error
+  while (!((TWI0.MSTATUS & TWI_BUSSTATE_gm) == TWI_BUSSTATE_IDLE_gc)); // Wait for bus to return to idle state
+  return false;
+} else if (TWI0.MSTATUS & TWI_RXACK_bm) {                       // Address not acknowledged by client
+  TWI0.MCTRLB |= TWI_MCMD_STOP_gc;                              // Send stop condition
+  while (!((TWI0.MSTATUS & TWI_BUSSTATE_gm) == TWI_BUSSTATE_IDLE_gc)); // Wait for bus to return to idle state
+  return false;
+}
+return true;                                                    // Return true if slave gave an ACK
 }
 
 bool I2Crestart (uint8_t address, uint8_t read) {
@@ -1777,27 +1853,16 @@ bool I2Crestart (uint8_t address, uint8_t read) {
 }
 
 void I2Cstop (uint8_t read) {
-#if defined(CPU_ATmega4809) || defined(CPU_AVR128DX48)
-  (void) read;
-  TWI0.MCTRLB |= TWI_MCMD_STOP_gc;                                // Send STOP
-  while (!((TWI0.MSTATUS & TWI_BUSSTATE_gm) == TWI_BUSSTATE_IDLE_gc)); // Wait for bus to return to idle state
-#else
-  (void) read;
-  TWCR = 1<<TWINT | 1<<TWEN | 1<<TWSTO;
-  while (TWCR & 1<<TWSTO); // wait until stop and bus released
-#endif
+(void) read;
+TWI0.MCTRLB |= TWI_MCMD_STOP_gc;                                // Send STOP
+while (!((TWI0.MSTATUS & TWI_BUSSTATE_gm) == TWI_BUSSTATE_IDLE_gc)); // Wait for bus to return to idle state
 }
 
 // Streams
 
 inline int spiread () { return SPI.transfer(0); }
-#if defined(CPU_ATmega1284P) || defined(CPU_AVR128DX48)
 inline int serial1read () { while (!Serial1.available()) testescape(); return Serial1.read(); }
-#elif defined(CPU_ATmega2560)
-inline int serial1read () { while (!Serial1.available()) testescape(); return Serial1.read(); }
-inline int serial2read () { while (!Serial2.available()) testescape(); return Serial2.read(); }
-inline int serial3read () { while (!Serial3.available()) testescape(); return Serial3.read(); }
-#endif
+
 #if defined(sdcardsupport)
 File SDpfile, SDgfile;
 inline int SDread () {
@@ -1811,29 +1876,12 @@ inline int SDread () {
 #endif
 
 void serialbegin (int address, int baud) {
-  #if defined(CPU_ATmega328P)
-  (void) address; (void) baud;
-  #elif defined(CPU_ATmega1284P) || defined(CPU_AVR128DX48)
   if (address == 1) Serial1.begin((long)baud*100);
   else error(PSTR("port not supported"), number(address));
-  #elif defined(CPU_ATmega2560)
-  if (address == 1) Serial1.begin((long)baud*100);
-  else if (address == 2) Serial2.begin((long)baud*100);
-  else if (address == 3) Serial3.begin((long)baud*100);
-  else error(PSTR("port not supported"), number(address));
-  #endif
 }
 
 void serialend (int address) {
-  #if defined(CPU_ATmega328P)
-  (void) address;
-  #elif defined(CPU_ATmega1284P) || defined(CPU_AVR128DX48)
   if (address == 1) {Serial1.flush(); Serial1.end(); }
-  #elif defined(CPU_ATmega2560)
-  if (address == 1) {Serial1.flush(); Serial1.end(); }
-  else if (address == 2) {Serial2.flush(); Serial2.end(); }
-  else if (address == 3) {Serial3.flush(); Serial3.end(); }
-  #endif
 }
 
 gfun_t gstreamfun (object *args) {
@@ -1864,15 +1912,10 @@ gfun_t gstreamfun (object *args) {
 }
 
 inline void spiwrite (char c) { SPI.transfer(c); }
-#if defined(CPU_ATmega1284P) || defined(CPU_AVR128DX48)
 inline void serial1write (char c) { Serial1.write(c); }
-#elif defined(CPU_ATmega2560)
-inline void serial1write (char c) { Serial1.write(c); }
-inline void serial2write (char c) { Serial2.write(c); }
-inline void serial3write (char c) { Serial3.write(c); }
-#endif
+
 #if defined(sdcardsupport)
-inline void SDwrite (char c) { SDpfile.write(c); }
+inline void SDwrite (char c) { int w = SDpfile.write(c); if (w != 1) { Context = NIL; error2(PSTR("failed to write to file")); } }
 #endif
 
 pfun_t pstreamfun (object *args) {
@@ -1887,13 +1930,7 @@ pfun_t pstreamfun (object *args) {
   else if (streamtype == SPISTREAM) pfun = spiwrite;
   else if (streamtype == SERIALSTREAM) {
     if (address == 0) pfun = pserial;
-    #if defined(CPU_ATmega1284P) || defined(CPU_AVR128DX48)
     else if (address == 1) pfun = serial1write;
-    #elif defined(CPU_ATmega2560)
-    else if (address == 1) pfun = serial1write;
-    else if (address == 2) pfun = serial2write;
-    else if (address == 3) pfun = serial3write;
-    #endif
   }   
   else if (streamtype == STRINGSTREAM) {
     pfun = pstr;
@@ -1931,13 +1968,6 @@ void nonote (int pin) {
 }
 
 // Sleep
-
-#if !defined(CPU_ATmega4809) && !defined(CPU_AVR128DX48)
-  // Interrupt vector for sleep watchdog
-  ISR(WDT_vect) {
-  WDTCSR |= 1<<WDIE;
-}
-#endif
 
 void initsleep () {
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
@@ -1998,30 +2028,35 @@ void superprint (object *form, int lm, pfun_t pfun) {
   if (atom(form)) {
     if (symbolp(form) && form->name == sym(NOTHING)) printsymbol(form, pfun);
     else printobject(form, pfun);
+  } else if (quoted(form)) {
+    pfun('\'');
+    superprint(car(cdr(form)), lm + 1, pfun);
+  } else {
+    lm = lm + PPINDENT;
+    bool fits = (subwidth(form, PPWIDTH - lm - PPINDENT) >= 0);
+    int special = 0, extra = 0; bool separate = true;
+    object *arg = car(form);
+    if (symbolp(arg) && builtinp(arg->name)) {
+      uint8_t minmax = getminmax(builtin(arg->name));
+      if (minmax == 0327 || minmax == 0313) special = 2; // defun, setq, setf, defvar
+      else if (minmax == 0317 || minmax == 0017 || minmax == 0117 || minmax == 0123) special = 1;
+    }
+    while (form != NULL) {
+      if (atom(form)) { pfstring(PSTR(" . "), pfun); printobject(form, pfun); pfun(')'); return; }
+      else if (separate) { 
+        pfun('(');
+        separate = false;
+      } else if (special) {
+        pfun(' ');
+        special--; 
+      } else if (fits) {
+        pfun(' ');
+      } else { pln(pfun); indent(lm, ' ', pfun); }
+      superprint(car(form), lm+extra, pfun);
+      form = cdr(form);
+    }
+    pfun(')');
   }
-  else if (quoted(form)) { pfun('\''); superprint(car(cdr(form)), lm + 1, pfun); }
-  else if (subwidth(form, PPWIDTH - lm) >= 0) supersub(form, lm + PPINDENT, 0, pfun);
-  else supersub(form, lm + PPINDENT, 1, pfun);
-}
-
-void supersub (object *form, int lm, int super, pfun_t pfun) {
-  int special = 0, separate = 1;
-  object *arg = car(form);
-  if (symbolp(arg) && builtinp(arg->name)) {
-    uint8_t minmax = getminmax(builtin(arg->name));
-    if (minmax == 0327 || minmax == 0313) special = 2; // defun, setq, setf, defvar
-    else if (minmax == 0317 || minmax == 0017 || minmax == 0117 || minmax == 0123) special = 1;
-  }
-  while (form != NULL) {
-    if (atom(form)) { pfstring(PSTR(" . "), pfun); printobject(form, pfun); pfun(')'); return; }
-    else if (separate) { pfun('('); separate = 0; }
-    else if (special) { pfun(' '); special--; }
-    else if (!super) pfun(' ');
-    else { pln(pfun); indent(lm, ' ', pfun); }
-    superprint(car(form), lm, pfun);
-    form = cdr(form);
-  }
-  pfun(')'); return;
 }
 
 object *edit (object *fun) {
@@ -2130,7 +2165,6 @@ int assemble (int pass, int origin, object *entries, object *env, object *pcpair
 
 object *sp_quote (object *args, object *env) {
   (void) env;
-  checkargs(args);
   return first(args);
 }
 
@@ -2145,7 +2179,6 @@ object *sp_or (object *args, object *env) {
 
 object *sp_defun (object *args, object *env) {
   (void) env;
-  checkargs(args);
   object *var = first(args);
   if (!symbolp(var)) error(notasymbol, var);
   object *val = cons(bsymbol(LAMBDA), cdr(args));
@@ -2156,7 +2189,6 @@ object *sp_defun (object *args, object *env) {
 }
 
 object *sp_defvar (object *args, object *env) {
-  checkargs(args);
   object *var = first(args);
   if (!symbolp(var)) error(notasymbol, var);
   object *val = NULL;
@@ -2204,17 +2236,20 @@ object *sp_return (object *args, object *env) {
 
 object *sp_push (object *args, object *env) {
   int bit;
-  checkargs(args);
   object *item = eval(first(args), env);
   object **loc = place(second(args), env, &bit);
+  if (bit != -1) error2(invalidarg);
   push(item, *loc);
   return *loc;
 }
 
 object *sp_pop (object *args, object *env) {
   int bit;
-  checkargs(args);
-  object **loc = place(first(args), env, &bit);
+  object *arg = first(args);
+  if (arg == NULL) error2(invalidarg);
+  object **loc = place(arg, env, &bit);
+  if (bit < -1) error(invalidarg, arg);
+  if (!consp(*loc)) error(notalist, *loc);
   object *result = car(*loc);
   pop(*loc);
   return result;
@@ -2238,6 +2273,7 @@ object *sp_setf (object *args, object *env) {
     object **loc = place(first(args), env, &bit);
     arg = eval(second(args), env);
     if (bit == -1) *loc = arg;
+    else if (bit < -1) (*loc)->chars = ((*loc)->chars & ~(0xff<<((-bit-2)<<3))) | checkchar(arg)<<((-bit-2)<<3);
     else *loc = number((checkinteger(*loc) & ~(1<<bit)) | checkbitvalue(arg)<<bit);
     args = cddr(args);
   }
@@ -2250,10 +2286,10 @@ object *sp_dolist (object *args, object *env) {
   object *params = checkarguments(args, 2, 3);
   object *var = first(params);
   object *list = eval(second(params), env);
-  push(list, GCStack); // Don't GC the list
+  protect(list); // Don't GC the list
   object *pair = cons(var,nil);
   push(pair,env);
-  params = cdr(cdr(params));
+  params = cddr(params);
   args = cdr(args);
   while (list != NULL) {
     if (improperp(list)) error(notproper, list);
@@ -2263,7 +2299,7 @@ object *sp_dolist (object *args, object *env) {
       object *result = eval(car(forms), env);
       if (tstflag(RETURNFLAG)) {
         clrflag(RETURNFLAG);
-        pop(GCStack);
+        unprotect();
         return result;
       }
       forms = cdr(forms);
@@ -2271,7 +2307,7 @@ object *sp_dolist (object *args, object *env) {
     list = cdr(list);
   }
   cdr(pair) = nil;
-  pop(GCStack);
+  unprotect();
   if (params == NULL) return nil;
   return eval(car(params), env);
 }
@@ -2281,7 +2317,7 @@ object *sp_dotimes (object *args, object *env) {
   object *var = first(params);
   int count = checkinteger(eval(second(params), env));
   int index = 0;
-  params = cdr(cdr(params));
+  params = cddr(params);
   object *pair = cons(var,number(0));
   push(pair,env);
   args = cdr(args);
@@ -2301,6 +2337,14 @@ object *sp_dotimes (object *args, object *env) {
   cdr(pair) = number(index);
   if (params == NULL) return nil;
   return eval(car(params), env);
+}
+
+object *sp_do (object *args, object *env) {
+  return dobody(args, env, false);
+}
+
+object *sp_dostar (object *args, object *env) {
+  return dobody(args, env, true);
 }
 
 object *sp_trace (object *args, object *env) {
@@ -2377,10 +2421,10 @@ object *sp_withoutputtostring (object *args, object *env) {
   object *pair = cons(var, stream(STRINGSTREAM, 0));
   push(pair,env);
   object *string = startstring();
-  push(string, GCStack);
+  protect(string);
   object *forms = cdr(args);
   eval(tf_progn(forms,env), env);
-  pop(GCStack);
+  unprotect();
   return string;
 }
 
@@ -2463,7 +2507,10 @@ object *sp_withsdcard (object *args, object *env) {
   object *var = first(params);
   params = cdr(params);
   if (params == NULL) error2(PSTR("no filename specified"));
+  builtin_t temp = Context;
   object *filename = eval(first(params), env);
+  Context = temp;
+  if (!stringp(filename)) error(PSTR("filename is not a string"), filename);
   params = cdr(params);
   SD.begin(SDCARD_SS_PIN);
   int mode = 0;
@@ -2497,7 +2544,6 @@ object *sp_withsdcard (object *args, object *env) {
 object *sp_defcode (object *args, object *env) {
 #if defined(CODESIZE)
   setflag(NOESC);
-  checkargs(args);
   object *var = first(args);
   if (!symbolp(var)) error(PSTR("not a symbol"), var);
 
@@ -2606,7 +2652,7 @@ object *tf_progn (object *args, object *env) {
   object *more = cdr(args);
   while (more != NULL) {
     object *result = eval(car(args),env);
-    if (tstflag(RETURNFLAG)) return result;
+    if (tstflag(RETURNFLAG)) return quote(result);
     args = more;
     more = cdr(args);
   }
@@ -2720,7 +2766,9 @@ object *fn_boundp (object *args, object *env) {
 
 object *fn_keywordp (object *args, object *env) {
   (void) env;
-  return keywordp(first(args)) ? tee : nil;
+  object *arg = first(args);
+  if (!symbolp(arg)) return nil;
+  return (keywordp(arg) || colonp(arg->name)) ? tee : nil;
 }
 
 object *fn_setfn (object *args, object *env) {
@@ -2845,6 +2893,19 @@ object *fn_list (object *args, object *env) {
   return args;
 }
 
+object *fn_copylist (object *args, object *env) {
+  (void) env;
+  object *arg = first(args);
+  if (!listp(arg)) error(notalist, arg);
+  object *result = cons(NULL, NULL);
+  object *ptr = result;
+  while (arg != NULL) {
+    cdr(ptr) = cons(car(arg), NULL); 
+    ptr = cdr(ptr); arg = cdr(arg);
+  }
+  return cdr(result);
+}
+
 object *fn_makearray (object *args, object *env) {
   (void) env;
   object *def = nil;
@@ -2907,16 +2968,25 @@ object *fn_assoc (object *args, object *env) {
   (void) env;
   object *key = first(args);
   object *list = second(args);
-  return assoc(key,list);
+  object *test = testargument(cddr(args));
+  while (list != NULL) {
+    if (improperp(list)) error(notproper, list);
+    object *pair = first(list);
+    if (!listp(pair)) error(PSTR("element is not a list"), pair);
+    if (pair != NULL && apply(test, cons(key, cons(car(pair), NULL)), env) != NULL) return pair;
+    list = cdr(list);
+  }
+  return nil;
 }
 
 object *fn_member (object *args, object *env) {
   (void) env;
   object *item = first(args);
   object *list = second(args);
+  object *test = testargument(cddr(args));
   while (list != NULL) {
     if (improperp(list)) error(notproper, list);
-    if (eq(item,car(list))) return list;
+    if (apply(test, cons(item, cons(car(list), NULL)), env) != NULL) return list;
     list = cdr(list);
   }
   return nil;
@@ -2960,38 +3030,27 @@ object *fn_append (object *args, object *env) {
 }
 
 object *fn_mapc (object *args, object *env) {
-  object *function = first(args);
-  args = cdr(args);
-  object *result = first(args);
-  push(result,GCStack);
-  object *params = cons(NULL, NULL);
-  push(params,GCStack);
-  // Make parameters
-  while (true) {
-    object *tailp = params;
-    object *lists = args;
-    while (lists != NULL) {
-      object *list = car(lists);
-      if (list == NULL) {
-         pop(GCStack); pop(GCStack);
-         return result;
-      }
-      if (improperp(list)) error(notproper, list);
-      object *obj = cons(first(list),NULL);
-      car(lists) = cdr(list);
-      cdr(tailp) = obj; tailp = obj;
-      lists = cdr(lists);
-    }
-    apply(function, cdr(params), env);
-  }
+  return mapcl(args, env, false);
+}
+
+object *fn_mapl (object *args, object *env) {
+  return mapcl(args, env, true);
 }
 
 object *fn_mapcar (object *args, object *env) {
-  return mapcarcan(args, env, mapcarfun);
+  return mapcarcan(args, env, mapcarfun, false);
 }
 
 object *fn_mapcan (object *args, object *env) {
-  return mapcarcan(args, env, mapcanfun);
+  return mapcarcan(args, env, mapcanfun, false);
+}
+
+object *fn_maplist (object *args, object *env) {
+  return mapcarcan(args, env, mapcarfun, true);
+}
+
+object *fn_mapcon (object *args, object *env) {
+  return mapcarcan(args, env, mapcanfun, true);
 }
 
 // Arithmetic functions
@@ -3250,26 +3309,47 @@ object *fn_stringp (object *args, object *env) {
 
 object *fn_stringeq (object *args, object *env) {
   (void) env;
-  return stringcompare(args, false, false, true) ? tee : nil;
+  int m = stringcompare(args, false, false, true);
+  return m == -1 ? nil : tee;
 }
 
 object *fn_stringless (object *args, object *env) {
   (void) env;
-  return stringcompare(args, true, false, false) ? tee : nil;
+  int m = stringcompare(args, true, false, false);
+  return m == -1 ? nil : number(m);
 }
 
 object *fn_stringgreater (object *args, object *env) {
   (void) env;
-  return stringcompare(args, false, true, false) ? tee : nil;
+  int m = stringcompare(args, false, true, false);
+  return m == -1 ? nil : number(m);
+}
+
+object *fn_stringnoteq (object *args, object *env) {
+  (void) env;
+  int m = stringcompare(args, true, true, false);
+  return m == -1 ? nil : number(m);
+}
+
+object *fn_stringlesseq (object *args, object *env) {
+  (void) env;
+  int m = stringcompare(args, true, false, true);
+  return m == -1 ? nil : number(m);
+}
+
+object *fn_stringgreatereq (object *args, object *env) {
+  (void) env;
+  int m = stringcompare(args, false, true, true);
+  return m == -1 ? nil : number(m);
 }
 
 object *fn_sort (object *args, object *env) {
   if (first(args) == NULL) return nil;
   object *list = cons(nil,first(args));
-  push(list,GCStack);
+  protect(list);
   object *predicate = second(args);
   object *compare = cons(NULL, cons(NULL, NULL));
-  push(compare,GCStack);
+  protect(compare);
   object *ptr = cdr(list);
   while (cdr(ptr) != NULL) {
     object *go = list;
@@ -3286,7 +3366,7 @@ object *fn_sort (object *args, object *env) {
       cdr(go) = obj;
     } else ptr = cdr(ptr);
   }
-  pop(GCStack); pop(GCStack);
+  unprotect(); unprotect();
   return cdr(list);
 }
 
@@ -3356,12 +3436,14 @@ object *fn_search (object *args, object *env) {
   object *target = second(args);
   if (pattern == NULL) return number(0);
   else if (target == NULL) return nil;
+  
   else if (listp(pattern) && listp(target)) {
+    object *test = testargument(cddr(args));
     int l = listlength(target);
     int m = listlength(pattern);
     for (int i = 0; i <= l-m; i++) {
       object *target1 = target;
-      while (pattern != NULL && eq(car(target1), car(pattern))) {
+      while (pattern != NULL && apply(test, cons(car(target1), cons(car(pattern), NULL)), env) != NULL) {
         pattern = cdr(pattern);
         target1 = cdr(target1);
       }
@@ -3369,7 +3451,9 @@ object *fn_search (object *args, object *env) {
       pattern = first(args); target = cdr(target);
     }
     return nil;
+
   } else if (stringp(pattern) && stringp(target)) {
+    if (cddr(args) != NULL) error2(PSTR("keyword argument not supported for strings"));
     int l = stringlength(target);
     int m = stringlength(pattern);
     for (int i = 0; i <= l-m; i++) {
@@ -3464,6 +3548,12 @@ object *fn_eval (object *args, object *env) {
   return eval(first(args), env);
 }
 
+object *fn_return (object *args, object *env) {
+  (void) env;
+  setflag(RETURNFLAG);
+  if (args == NULL) return nil; else return first(args);
+}
+
 object *fn_globals (object *args, object *env) {
   (void) args, (void) env;
   object *result = cons(NULL, NULL);
@@ -3547,7 +3637,7 @@ object *fn_readbyte (object *args, object *env) {
 object *fn_readline (object *args, object *env) {
   (void) env;
   gfun_t gfun = gstreamfun(args);
-  return readstring('\n', gfun);
+  return readstring('\n', false, gfun);
 }
 
 object *fn_writebyte (object *args, object *env) {
@@ -3583,7 +3673,7 @@ object *fn_writeline (object *args, object *env) {
 
 object *fn_restarti2c (object *args, object *env) {
   (void) env;
-  int stream = first(args)->integer;
+  int stream = isstream(first(args));
   args = cdr(args);
   int read = 0; // Write
   I2Ccount = 0;
@@ -4263,187 +4353,198 @@ const char string0[] PROGMEM = "nil";
 const char string1[] PROGMEM = "t";
 const char string2[] PROGMEM = "nothing";
 const char string3[] PROGMEM = "&optional";
-const char string4[] PROGMEM = ":initial-element";
-const char string5[] PROGMEM = ":element-type";
-const char string6[] PROGMEM = "bit";
-const char string7[] PROGMEM = "&rest";
-const char string8[] PROGMEM = "lambda";
-const char string9[] PROGMEM = "let";
-const char string10[] PROGMEM = "let*";
-const char string11[] PROGMEM = "closure";
-const char string12[] PROGMEM = "*p*";
-const char string13[] PROGMEM = "quote";
-const char string14[] PROGMEM = "defun";
-const char string15[] PROGMEM = "defvar";
-const char string16[] PROGMEM = "defcode";
-const char string17[] PROGMEM = "car";
-const char string18[] PROGMEM = "first";
-const char string19[] PROGMEM = "cdr";
-const char string20[] PROGMEM = "rest";
-const char string21[] PROGMEM = "nth";
-const char string22[] PROGMEM = "aref";
-const char string23[] PROGMEM = "string";
-const char string24[] PROGMEM = "pinmode";
-const char string25[] PROGMEM = "digitalwrite";
-const char string26[] PROGMEM = "analogread";
-const char string27[] PROGMEM = "analogreference";
-const char string28[] PROGMEM = "register";
-const char string29[] PROGMEM = "format";
-const char string30[] PROGMEM = "or";
-const char string31[] PROGMEM = "setq";
-const char string32[] PROGMEM = "loop";
-const char string33[] PROGMEM = "return";
-const char string34[] PROGMEM = "push";
-const char string35[] PROGMEM = "pop";
-const char string36[] PROGMEM = "incf";
-const char string37[] PROGMEM = "decf";
-const char string38[] PROGMEM = "setf";
-const char string39[] PROGMEM = "dolist";
-const char string40[] PROGMEM = "dotimes";
-const char string41[] PROGMEM = "trace";
-const char string42[] PROGMEM = "untrace";
-const char string43[] PROGMEM = "for-millis";
-const char string44[] PROGMEM = "time";
-const char string45[] PROGMEM = "with-output-to-string";
-const char string46[] PROGMEM = "with-serial";
-const char string47[] PROGMEM = "with-i2c";
-const char string48[] PROGMEM = "with-spi";
-const char string49[] PROGMEM = "with-sd-card";
-const char string50[] PROGMEM = "progn";
-const char string51[] PROGMEM = "if";
-const char string52[] PROGMEM = "cond";
-const char string53[] PROGMEM = "when";
-const char string54[] PROGMEM = "unless";
-const char string55[] PROGMEM = "case";
-const char string56[] PROGMEM = "and";
-const char string57[] PROGMEM = "not";
-const char string58[] PROGMEM = "null";
-const char string59[] PROGMEM = "cons";
-const char string60[] PROGMEM = "atom";
-const char string61[] PROGMEM = "listp";
-const char string62[] PROGMEM = "consp";
-const char string63[] PROGMEM = "symbolp";
-const char string64[] PROGMEM = "arrayp";
-const char string65[] PROGMEM = "boundp";
-const char string66[] PROGMEM = "keywordp";
-const char string67[] PROGMEM = "set";
-const char string68[] PROGMEM = "streamp";
-const char string69[] PROGMEM = "eq";
-const char string70[] PROGMEM = "equal";
-const char string71[] PROGMEM = "caar";
-const char string72[] PROGMEM = "cadr";
-const char string73[] PROGMEM = "second";
-const char string74[] PROGMEM = "cdar";
-const char string75[] PROGMEM = "cddr";
-const char string76[] PROGMEM = "caaar";
-const char string77[] PROGMEM = "caadr";
-const char string78[] PROGMEM = "cadar";
-const char string79[] PROGMEM = "caddr";
-const char string80[] PROGMEM = "third";
-const char string81[] PROGMEM = "cdaar";
-const char string82[] PROGMEM = "cdadr";
-const char string83[] PROGMEM = "cddar";
-const char string84[] PROGMEM = "cdddr";
-const char string85[] PROGMEM = "length";
-const char string86[] PROGMEM = "array-dimensions";
-const char string87[] PROGMEM = "list";
-const char string88[] PROGMEM = "make-array";
-const char string89[] PROGMEM = "reverse";
-const char string90[] PROGMEM = "assoc";
-const char string91[] PROGMEM = "member";
-const char string92[] PROGMEM = "apply";
-const char string93[] PROGMEM = "funcall";
-const char string94[] PROGMEM = "append";
-const char string95[] PROGMEM = "mapc";
-const char string96[] PROGMEM = "mapcar";
-const char string97[] PROGMEM = "mapcan";
-const char string98[] PROGMEM = "+";
-const char string99[] PROGMEM = "-";
-const char string100[] PROGMEM = "*";
-const char string101[] PROGMEM = "/";
-const char string102[] PROGMEM = "truncate";
-const char string103[] PROGMEM = "mod";
-const char string104[] PROGMEM = "1+";
-const char string105[] PROGMEM = "1-";
-const char string106[] PROGMEM = "abs";
-const char string107[] PROGMEM = "random";
-const char string108[] PROGMEM = "max";
-const char string109[] PROGMEM = "min";
-const char string110[] PROGMEM = "/=";
-const char string111[] PROGMEM = "=";
-const char string112[] PROGMEM = "<";
-const char string113[] PROGMEM = "<=";
-const char string114[] PROGMEM = ">";
-const char string115[] PROGMEM = ">=";
-const char string116[] PROGMEM = "plusp";
-const char string117[] PROGMEM = "minusp";
-const char string118[] PROGMEM = "zerop";
-const char string119[] PROGMEM = "oddp";
-const char string120[] PROGMEM = "evenp";
-const char string121[] PROGMEM = "integerp";
-const char string122[] PROGMEM = "numberp";
-const char string123[] PROGMEM = "char";
-const char string124[] PROGMEM = "char-code";
-const char string125[] PROGMEM = "code-char";
-const char string126[] PROGMEM = "characterp";
-const char string127[] PROGMEM = "stringp";
-const char string128[] PROGMEM = "string=";
-const char string129[] PROGMEM = "string<";
-const char string130[] PROGMEM = "string>";
-const char string131[] PROGMEM = "sort";
-const char string132[] PROGMEM = "concatenate";
-const char string133[] PROGMEM = "subseq";
-const char string134[] PROGMEM = "search";
-const char string135[] PROGMEM = "read-from-string";
-const char string136[] PROGMEM = "princ-to-string";
-const char string137[] PROGMEM = "prin1-to-string";
-const char string138[] PROGMEM = "logand";
-const char string139[] PROGMEM = "logior";
-const char string140[] PROGMEM = "logxor";
-const char string141[] PROGMEM = "lognot";
-const char string142[] PROGMEM = "ash";
-const char string143[] PROGMEM = "logbitp";
-const char string144[] PROGMEM = "eval";
-const char string145[] PROGMEM = "globals";
-const char string146[] PROGMEM = "locals";
-const char string147[] PROGMEM = "makunbound";
-const char string148[] PROGMEM = "break";
-const char string149[] PROGMEM = "read";
-const char string150[] PROGMEM = "prin1";
-const char string151[] PROGMEM = "print";
-const char string152[] PROGMEM = "princ";
-const char string153[] PROGMEM = "terpri";
-const char string154[] PROGMEM = "read-byte";
-const char string155[] PROGMEM = "read-line";
-const char string156[] PROGMEM = "write-byte";
-const char string157[] PROGMEM = "write-string";
-const char string158[] PROGMEM = "write-line";
-const char string159[] PROGMEM = "restart-i2c";
-const char string160[] PROGMEM = "gc";
-const char string161[] PROGMEM = "room";
-const char string162[] PROGMEM = "save-image";
-const char string163[] PROGMEM = "load-image";
-const char string164[] PROGMEM = "cls";
-const char string165[] PROGMEM = "digitalread";
-const char string166[] PROGMEM = "analogreadresolution";
-const char string167[] PROGMEM = "analogwrite";
-const char string168[] PROGMEM = "dacreference";
-const char string169[] PROGMEM = "delay";
-const char string170[] PROGMEM = "millis";
-const char string171[] PROGMEM = "sleep";
-const char string172[] PROGMEM = "note";
-const char string173[] PROGMEM = "edit";
-const char string174[] PROGMEM = "pprint";
-const char string175[] PROGMEM = "pprintall";
-const char string176[] PROGMEM = "require";
-const char string177[] PROGMEM = "list-library";
-const char string178[] PROGMEM = "?";
-const char string179[] PROGMEM = "documentation";
-const char string180[] PROGMEM = "apropos";
-const char string181[] PROGMEM = "apropos-list";
-const char string182[] PROGMEM = "unwind-protect";
-const char string183[] PROGMEM = "ignore-errors";
-const char string184[] PROGMEM = "error";
+const char string4[] PROGMEM = "*features*";
+const char string5[] PROGMEM = ":initial-element";
+const char string6[] PROGMEM = ":element-type";
+const char string7[] PROGMEM = ":test";
+const char string8[] PROGMEM = "bit";
+const char string9[] PROGMEM = "&rest";
+const char string10[] PROGMEM = "lambda";
+const char string11[] PROGMEM = "let";
+const char string12[] PROGMEM = "let*";
+const char string13[] PROGMEM = "closure";
+const char string14[] PROGMEM = "*p*";
+const char string15[] PROGMEM = "quote";
+const char string16[] PROGMEM = "defun";
+const char string17[] PROGMEM = "defvar";
+const char string18[] PROGMEM = "defcode";
+const char string19[] PROGMEM = "eq";
+const char string20[] PROGMEM = "car";
+const char string21[] PROGMEM = "first";
+const char string22[] PROGMEM = "cdr";
+const char string23[] PROGMEM = "rest";
+const char string24[] PROGMEM = "nth";
+const char string25[] PROGMEM = "aref";
+const char string26[] PROGMEM = "char";
+const char string27[] PROGMEM = "string";
+const char string28[] PROGMEM = "pinmode";
+const char string29[] PROGMEM = "digitalwrite";
+const char string30[] PROGMEM = "analogread";
+const char string31[] PROGMEM = "analogreference";
+const char string32[] PROGMEM = "register";
+const char string33[] PROGMEM = "format";
+const char string34[] PROGMEM = "or";
+const char string35[] PROGMEM = "setq";
+const char string36[] PROGMEM = "loop";
+const char string37[] PROGMEM = "push";
+const char string38[] PROGMEM = "pop";
+const char string39[] PROGMEM = "incf";
+const char string40[] PROGMEM = "decf";
+const char string41[] PROGMEM = "setf";
+const char string42[] PROGMEM = "dolist";
+const char string43[] PROGMEM = "dotimes";
+const char string44[] PROGMEM = "do";
+const char string45[] PROGMEM = "do*";
+const char string46[] PROGMEM = "trace";
+const char string47[] PROGMEM = "untrace";
+const char string48[] PROGMEM = "for-millis";
+const char string49[] PROGMEM = "time";
+const char string50[] PROGMEM = "with-output-to-string";
+const char string51[] PROGMEM = "with-serial";
+const char string52[] PROGMEM = "with-i2c";
+const char string53[] PROGMEM = "with-spi";
+const char string54[] PROGMEM = "with-sd-card";
+const char string55[] PROGMEM = "progn";
+const char string56[] PROGMEM = "if";
+const char string57[] PROGMEM = "cond";
+const char string58[] PROGMEM = "when";
+const char string59[] PROGMEM = "unless";
+const char string60[] PROGMEM = "case";
+const char string61[] PROGMEM = "and";
+const char string62[] PROGMEM = "not";
+const char string63[] PROGMEM = "null";
+const char string64[] PROGMEM = "cons";
+const char string65[] PROGMEM = "atom";
+const char string66[] PROGMEM = "listp";
+const char string67[] PROGMEM = "consp";
+const char string68[] PROGMEM = "symbolp";
+const char string69[] PROGMEM = "arrayp";
+const char string70[] PROGMEM = "boundp";
+const char string71[] PROGMEM = "keywordp";
+const char string72[] PROGMEM = "set";
+const char string73[] PROGMEM = "streamp";
+const char string74[] PROGMEM = "equal";
+const char string75[] PROGMEM = "caar";
+const char string76[] PROGMEM = "cadr";
+const char string77[] PROGMEM = "second";
+const char string78[] PROGMEM = "cdar";
+const char string79[] PROGMEM = "cddr";
+const char string80[] PROGMEM = "caaar";
+const char string81[] PROGMEM = "caadr";
+const char string82[] PROGMEM = "cadar";
+const char string83[] PROGMEM = "caddr";
+const char string84[] PROGMEM = "third";
+const char string85[] PROGMEM = "cdaar";
+const char string86[] PROGMEM = "cdadr";
+const char string87[] PROGMEM = "cddar";
+const char string88[] PROGMEM = "cdddr";
+const char string89[] PROGMEM = "length";
+const char string90[] PROGMEM = "array-dimensions";
+const char string91[] PROGMEM = "list";
+const char string92[] PROGMEM = "copy-list";
+const char string93[] PROGMEM = "make-array";
+const char string94[] PROGMEM = "reverse";
+const char string95[] PROGMEM = "assoc";
+const char string96[] PROGMEM = "member";
+const char string97[] PROGMEM = "apply";
+const char string98[] PROGMEM = "funcall";
+const char string99[] PROGMEM = "append";
+const char string100[] PROGMEM = "mapc";
+const char string101[] PROGMEM = "mapl";
+const char string102[] PROGMEM = "mapcar";
+const char string103[] PROGMEM = "mapcan";
+const char string104[] PROGMEM = "maplist";
+const char string105[] PROGMEM = "mapcon";
+const char string106[] PROGMEM = "+";
+const char string107[] PROGMEM = "-";
+const char string108[] PROGMEM = "*";
+const char string109[] PROGMEM = "/";
+const char string110[] PROGMEM = "truncate";
+const char string111[] PROGMEM = "mod";
+const char string112[] PROGMEM = "1+";
+const char string113[] PROGMEM = "1-";
+const char string114[] PROGMEM = "abs";
+const char string115[] PROGMEM = "random";
+const char string116[] PROGMEM = "max";
+const char string117[] PROGMEM = "min";
+const char string118[] PROGMEM = "/=";
+const char string119[] PROGMEM = "=";
+const char string120[] PROGMEM = "<";
+const char string121[] PROGMEM = "<=";
+const char string122[] PROGMEM = ">";
+const char string123[] PROGMEM = ">=";
+const char string124[] PROGMEM = "plusp";
+const char string125[] PROGMEM = "minusp";
+const char string126[] PROGMEM = "zerop";
+const char string127[] PROGMEM = "oddp";
+const char string128[] PROGMEM = "evenp";
+const char string129[] PROGMEM = "integerp";
+const char string130[] PROGMEM = "numberp";
+const char string131[] PROGMEM = "char-code";
+const char string132[] PROGMEM = "code-char";
+const char string133[] PROGMEM = "characterp";
+const char string134[] PROGMEM = "stringp";
+const char string135[] PROGMEM = "string=";
+const char string136[] PROGMEM = "string<";
+const char string137[] PROGMEM = "string>";
+const char string138[] PROGMEM = "string/=";
+const char string139[] PROGMEM = "string<=";
+const char string140[] PROGMEM = "string>=";
+const char string141[] PROGMEM = "sort";
+const char string142[] PROGMEM = "concatenate";
+const char string143[] PROGMEM = "subseq";
+const char string144[] PROGMEM = "search";
+const char string145[] PROGMEM = "read-from-string";
+const char string146[] PROGMEM = "princ-to-string";
+const char string147[] PROGMEM = "prin1-to-string";
+const char string148[] PROGMEM = "logand";
+const char string149[] PROGMEM = "logior";
+const char string150[] PROGMEM = "logxor";
+const char string151[] PROGMEM = "lognot";
+const char string152[] PROGMEM = "ash";
+const char string153[] PROGMEM = "logbitp";
+const char string154[] PROGMEM = "eval";
+const char string155[] PROGMEM = "return";
+const char string156[] PROGMEM = "globals";
+const char string157[] PROGMEM = "locals";
+const char string158[] PROGMEM = "makunbound";
+const char string159[] PROGMEM = "break";
+const char string160[] PROGMEM = "read";
+const char string161[] PROGMEM = "prin1";
+const char string162[] PROGMEM = "print";
+const char string163[] PROGMEM = "princ";
+const char string164[] PROGMEM = "terpri";
+const char string165[] PROGMEM = "read-byte";
+const char string166[] PROGMEM = "read-line";
+const char string167[] PROGMEM = "write-byte";
+const char string168[] PROGMEM = "write-string";
+const char string169[] PROGMEM = "write-line";
+const char string170[] PROGMEM = "restart-i2c";
+const char string171[] PROGMEM = "gc";
+const char string172[] PROGMEM = "room";
+const char string173[] PROGMEM = "save-image";
+const char string174[] PROGMEM = "load-image";
+const char string175[] PROGMEM = "cls";
+const char string176[] PROGMEM = "digitalread";
+const char string177[] PROGMEM = "analogreadresolution";
+const char string178[] PROGMEM = "analogwrite";
+const char string179[] PROGMEM = "dacreference";
+const char string180[] PROGMEM = "delay";
+const char string181[] PROGMEM = "millis";
+const char string182[] PROGMEM = "sleep";
+const char string183[] PROGMEM = "note";
+const char string184[] PROGMEM = "edit";
+const char string185[] PROGMEM = "pprint";
+const char string186[] PROGMEM = "pprintall";
+const char string187[] PROGMEM = "require";
+const char string188[] PROGMEM = "list-library";
+const char string189[] PROGMEM = "?";
+const char string190[] PROGMEM = "documentation";
+const char string191[] PROGMEM = "apropos";
+const char string192[] PROGMEM = "apropos-list";
+const char string193[] PROGMEM = "unwind-protect";
+const char string194[] PROGMEM = "ignore-errors";
+const char string195[] PROGMEM = "error";
 const char stringG1[] PROGMEM = "draw-pixel";
 const char stringG2[] PROGMEM = "draw-line";
 const char stringG3[] PROGMEM = "draw-rect";
@@ -4464,40 +4565,41 @@ const char stringG17[] PROGMEM = "check-key";
 const char stringG18[] PROGMEM = "keyboard";
 const char stringG19[] PROGMEM = ":shift-key";
 const char stringG20[] PROGMEM = ":meta-key";
-const char string185[] PROGMEM = ":led-builtin";
-const char string186[] PROGMEM = ":high";
-const char string187[] PROGMEM = ":low";
-const char string188[] PROGMEM = ":input";
-const char string189[] PROGMEM = ":input-pullup";
-const char string190[] PROGMEM = ":output";
-const char string191[] PROGMEM = ":default";
-const char string192[] PROGMEM = ":vdd";
-const char string193[] PROGMEM = ":internal1v024";
-const char string194[] PROGMEM = ":internal2v048";
-const char string195[] PROGMEM = ":internal4v096";
-const char string196[] PROGMEM = ":internal2v5";
-const char string197[] PROGMEM = ":external";
-const char string198[] PROGMEM = ":adc-dac0";
-const char string199[] PROGMEM = ":adc-temperature";
-const char string200[] PROGMEM = ":porta-dir";
-const char string201[] PROGMEM = ":porta-out";
-const char string202[] PROGMEM = ":porta-in";
-const char string203[] PROGMEM = ":portb-dir";
-const char string204[] PROGMEM = ":portb-out";
-const char string205[] PROGMEM = ":portb-in";
-const char string206[] PROGMEM = ":portc-dir";
-const char string207[] PROGMEM = ":portc-out";
-const char string208[] PROGMEM = ":portc-in";
-const char string209[] PROGMEM = ":portd-dir";
-const char string210[] PROGMEM = ":portd-out";
-const char string211[] PROGMEM = ":portd-in";
-const char string212[] PROGMEM = ":porte-dir";
-const char string213[] PROGMEM = ":porte-out";
-const char string214[] PROGMEM = ":porte-in";
-const char string215[] PROGMEM = ":portf-dir";
-const char string216[] PROGMEM = ":portf-out";
-const char string217[] PROGMEM = ":portf-in";
+const char string196[] PROGMEM = ":led-builtin";
+const char string197[] PROGMEM = ":high";
+const char string198[] PROGMEM = ":low";
+const char string199[] PROGMEM = ":input";
+const char string200[] PROGMEM = ":input-pullup";
+const char string201[] PROGMEM = ":output";
+const char string202[] PROGMEM = ":default";
+const char string203[] PROGMEM = ":vdd";
+const char string204[] PROGMEM = ":internal1v024";
+const char string205[] PROGMEM = ":internal2v048";
+const char string206[] PROGMEM = ":internal4v096";
+const char string207[] PROGMEM = ":internal2v5";
+const char string208[] PROGMEM = ":external";
+const char string209[] PROGMEM = ":adc-dac0";
+const char string210[] PROGMEM = ":adc-temperature";
+const char string211[] PROGMEM = ":porta-dir";
+const char string212[] PROGMEM = ":porta-out";
+const char string213[] PROGMEM = ":porta-in";
+const char string214[] PROGMEM = ":portb-dir";
+const char string215[] PROGMEM = ":portb-out";
+const char string216[] PROGMEM = ":portb-in";
+const char string217[] PROGMEM = ":portc-dir";
+const char string218[] PROGMEM = ":portc-out";
+const char string219[] PROGMEM = ":portc-in";
+const char string220[] PROGMEM = ":portd-dir";
+const char string221[] PROGMEM = ":portd-out";
+const char string222[] PROGMEM = ":portd-in";
+const char string223[] PROGMEM = ":porte-dir";
+const char string224[] PROGMEM = ":porte-out";
+const char string225[] PROGMEM = ":porte-in";
+const char string226[] PROGMEM = ":portf-dir";
+const char string227[] PROGMEM = ":portf-out";
+const char string228[] PROGMEM = ":portf-in";
 
+// Documentation strings
 // Documentation strings
 const char doc0[] PROGMEM = "nil\n"
 "A symbol equivalent to the empty list (). Also represents false.";
@@ -4508,396 +4610,425 @@ const char doc2[] PROGMEM = "nothing\n"
 "It is useful if you want to suppress printing the result of evaluating a function.";
 const char doc3[] PROGMEM = "&optional\n"
 "Can be followed by one or more optional parameters in a lambda or defun parameter list.";
-const char doc7[] PROGMEM = "&rest\n"
+const char doc4[] PROGMEM = "*features*\n"
+"Returns a list of keywords representing features supported by this platform.";
+const char doc9[] PROGMEM = "&rest\n"
 "Can be followed by a parameter in a lambda or defun parameter list,\n"
 "and is assigned a list of the corresponding arguments.";
-const char doc8[] PROGMEM = "(lambda (parameter*) form*)\n"
+const char doc10[] PROGMEM = "(lambda (parameter*) form*)\n"
 "Creates an unnamed function with parameters. The body is evaluated with the parameters as local variables\n"
 "whose initial values are defined by the values of the forms after the lambda form.";
-const char doc9[] PROGMEM = "(let ((var value) ... ) forms*)\n"
+const char doc11[] PROGMEM = "(let ((var value) ... ) forms*)\n"
 "Declares local variables with values, and evaluates the forms with those local variables.";
-const char doc10[] PROGMEM = "(let* ((var value) ... ) forms*)\n"
+const char doc12[] PROGMEM = "(let* ((var value) ... ) forms*)\n"
 "Declares local variables with values, and evaluates the forms with those local variables.\n"
 "Each declaration can refer to local variables that have been defined earlier in the let*.";
-const char doc14[] PROGMEM = "(defun name (parameters) form*)\n"
+const char doc16[] PROGMEM = "(defun name (parameters) form*)\n"
 "Defines a function.";
-const char doc15[] PROGMEM = "(defvar variable form)\n"
+const char doc17[] PROGMEM = "(defvar variable form)\n"
 "Defines a global variable.";
-const char doc16[] PROGMEM = "(defcode name (parameters) form*)\n"
+const char doc18[] PROGMEM = "(defcode name (parameters) form*)\n"
 "Creates a machine-code function called name from a series of 16-bit integers given in the body of the form.\n"
 "These are written into RAM, and can be executed by calling the function in the same way as a normal Lisp function.";
-const char doc17[] PROGMEM = "(car list)\n"
+const char doc19[] PROGMEM = "(eq item item)\n"
+"Tests whether the two arguments are the same symbol, same character, equal numbers,\n"
+"or point to the same cons, and returns t or nil as appropriate.";
+const char doc20[] PROGMEM = "(car list)\n"
 "Returns the first item in a list.";
-const char doc19[] PROGMEM = "(cdr list)\n"
+const char doc22[] PROGMEM = "(cdr list)\n"
 "Returns a list with the first item removed.";
-const char doc21[] PROGMEM = "(nth number list)\n"
+const char doc24[] PROGMEM = "(nth number list)\n"
 "Returns the nth item in list, counting from zero.";
-const char doc22[] PROGMEM = "(aref array index [index*])\n"
+const char doc25[] PROGMEM = "(aref array index [index*])\n"
 "Returns an element from the specified array.";
-const char doc23[] PROGMEM = "(string item)\n"
+const char doc26[] PROGMEM = "(char string n)\n"
+"Returns the nth character in a string, counting from zero.";
+const char doc27[] PROGMEM = "(string item)\n"
 "Converts its argument to a string.";
-const char doc24[] PROGMEM = "(pinmode pin mode)\n"
+const char doc28[] PROGMEM = "(pinmode pin mode)\n"
 "Sets the input/output mode of an Arduino pin number, and returns nil.\n"
 "The mode parameter can be an integer, a keyword, or t or nil.";
-const char doc25[] PROGMEM = "(digitalwrite pin state)\n"
+const char doc29[] PROGMEM = "(digitalwrite pin state)\n"
 "Sets the state of the specified Arduino pin number.";
-const char doc26[] PROGMEM = "(analogread pin)\n"
+const char doc30[] PROGMEM = "(analogread pin)\n"
 "Reads the specified Arduino analogue pin number and returns the value.";
-const char doc27[] PROGMEM = "(analogreference keyword)\n"
+const char doc31[] PROGMEM = "(analogreference keyword)\n"
 "Specifies a keyword to set the analogue reference voltage used for analogue input.";
-const char doc28[] PROGMEM = "(register address [value])\n"
+const char doc32[] PROGMEM = "(register address [value])\n"
 "Reads or writes the value of a peripheral register.\n"
 "If value is not specified the function returns the value of the register at address.\n"
 "If value is specified the value is written to the register at address and the function returns value.";
-const char doc29[] PROGMEM = "(format output controlstring [arguments]*)\n"
+const char doc33[] PROGMEM = "(format output controlstring [arguments]*)\n"
 "Outputs its arguments formatted according to the format directives in controlstring.";
-const char doc30[] PROGMEM = "(or item*)\n"
+const char doc34[] PROGMEM = "(or item*)\n"
 "Evaluates its arguments until one returns non-nil, and returns its value.";
-const char doc31[] PROGMEM = "(setq symbol value [symbol value]*)\n"
+const char doc35[] PROGMEM = "(setq symbol value [symbol value]*)\n"
 "For each pair of arguments assigns the value of the second argument\n"
 "to the variable specified in the first argument.";
-const char doc32[] PROGMEM = "(loop forms*)\n"
+const char doc36[] PROGMEM = "(loop forms*)\n"
 "Executes its arguments repeatedly until one of the arguments calls (return),\n"
 "which then causes an exit from the loop.";
-const char doc33[] PROGMEM = "(return [value])\n"
-"Exits from a (dotimes ...), (dolist ...), or (loop ...) loop construct and returns value.";
-const char doc34[] PROGMEM = "(push item place)\n"
+const char doc37[] PROGMEM = "(push item place)\n"
 "Modifies the value of place, which should be a list, to add item onto the front of the list,\n"
 "and returns the new list.";
-const char doc35[] PROGMEM = "(pop place)\n"
-"Modifies the value of place, which should be a list, to remove its first item, and returns that item.";
-const char doc36[] PROGMEM = "(incf place [number])\n"
+const char doc38[] PROGMEM = "(pop place)\n"
+"Modifies the value of place, which should be a non-nil list, to remove its first item,\n"
+"and returns that item.";
+const char doc39[] PROGMEM = "(incf place [number])\n"
 "Increments a place, which should have an numeric value, and returns the result.\n"
 "The third argument is an optional increment which defaults to 1.";
-const char doc37[] PROGMEM = "(decf place [number])\n"
+const char doc40[] PROGMEM = "(decf place [number])\n"
 "Decrements a place, which should have an numeric value, and returns the result.\n"
 "The third argument is an optional decrement which defaults to 1.";
-const char doc38[] PROGMEM = "(setf place value [place value]*)\n"
+const char doc41[] PROGMEM = "(setf place value [place value]*)\n"
 "For each pair of arguments modifies a place to the result of evaluating value.";
-const char doc39[] PROGMEM = "(dolist (var list [result]) form*)\n"
+const char doc42[] PROGMEM = "(dolist (var list [result]) form*)\n"
 "Sets the local variable var to each element of list in turn, and executes the forms.\n"
 "It then returns result, or nil if result is omitted.";
-const char doc40[] PROGMEM = "(dotimes (var number [result]) form*)\n"
+const char doc43[] PROGMEM = "(dotimes (var number [result]) form*)\n"
 "Executes the forms number times, with the local variable var set to each integer from 0 to number-1 in turn.\n"
 "It then returns result, or nil if result is omitted.";
-const char doc41[] PROGMEM = "(trace [function]*)\n"
+const char doc44[] PROGMEM = "(do ((var [init [step]])*) (end-test result*) form*)\n"
+"Accepts an arbitrary number of iteration vars, which are initialised to init and stepped by step sequentially.\n"
+"The forms are executed until end-test is true. It returns result.";
+const char doc45[] PROGMEM = "(do* ((var [init [step]])*) (end-test result*) form*)\n"
+"Accepts an arbitrary number of iteration vars, which are initialised to init and stepped by step in parallel.\n"
+"The forms are executed until end-test is true. It returns result.";
+const char doc46[] PROGMEM = "(trace [function]*)\n"
 "Turns on tracing of up to TRACEMAX user-defined functions,\n"
 "and returns a list of the functions currently being traced.";
-const char doc42[] PROGMEM = "(untrace [function]*)\n"
+const char doc47[] PROGMEM = "(untrace [function]*)\n"
 "Turns off tracing of up to TRACEMAX user-defined functions, and returns a list of the functions untraced.\n"
 "If no functions are specified it untraces all functions.";
-const char doc43[] PROGMEM = "(for-millis ([number]) form*)\n"
+const char doc48[] PROGMEM = "(for-millis ([number]) form*)\n"
 "Executes the forms and then waits until a total of number milliseconds have elapsed.\n"
 "Returns the total number of milliseconds taken.";
-const char doc44[] PROGMEM = "(time form)\n"
+const char doc49[] PROGMEM = "(time form)\n"
 "Prints the value returned by the form, and the time taken to evaluate the form\n"
 "in milliseconds or seconds.";
-const char doc45[] PROGMEM = "(with-output-to-string (str) form*)\n"
+const char doc50[] PROGMEM = "(with-output-to-string (str) form*)\n"
 "Returns a string containing the output to the stream variable str.";
-const char doc46[] PROGMEM = "(with-serial (str port [baud]) form*)\n"
+const char doc51[] PROGMEM = "(with-serial (str port [baud]) form*)\n"
 "Evaluates the forms with str bound to a serial-stream using port.\n"
 "The optional baud gives the baud rate divided by 100, default 96.";
-const char doc47[] PROGMEM = "(with-i2c (str [port] address [read-p]) form*)\n"
+const char doc52[] PROGMEM = "(with-i2c (str [port] address [read-p]) form*)\n"
 "Evaluates the forms with str bound to an i2c-stream defined by address.\n"
 "If read-p is nil or omitted the stream is written to, otherwise it specifies the number of bytes\n"
 "to be read from the stream. The port if specified is ignored.";
-const char doc48[] PROGMEM = "(with-spi (str pin [clock] [bitorder] [mode]) form*)\n"
+const char doc53[] PROGMEM = "(with-spi (str pin [clock] [bitorder] [mode]) form*)\n"
 "Evaluates the forms with str bound to an spi-stream.\n"
 "The parameters specify the enable pin, clock in kHz (default 4000),\n"
 "bitorder 0 for LSBFIRST and 1 for MSBFIRST (default 1), and SPI mode (default 0).";
-const char doc49[] PROGMEM = "(with-sd-card (str filename [mode]) form*)\n"
+const char doc54[] PROGMEM = "(with-sd-card (str filename [mode]) form*)\n"
 "Evaluates the forms with str bound to an sd-stream reading from or writing to the file filename.\n"
 "If mode is omitted the file is read, otherwise 0 means read, 1 write-append, or 2 write-overwrite.";
-const char doc50[] PROGMEM = "(progn form*)\n"
+const char doc55[] PROGMEM = "(progn form*)\n"
 "Evaluates several forms grouped together into a block, and returns the result of evaluating the last form.";
-const char doc51[] PROGMEM = "(if test then [else])\n"
+const char doc56[] PROGMEM = "(if test then [else])\n"
 "Evaluates test. If it's non-nil the form then is evaluated and returned;\n"
 "otherwise the form else is evaluated and returned.";
-const char doc52[] PROGMEM = "(cond ((test form*) (test form*) ... ))\n"
+const char doc57[] PROGMEM = "(cond ((test form*) (test form*) ... ))\n"
 "Each argument is a list consisting of a test optionally followed by one or more forms.\n"
 "If the test evaluates to non-nil the forms are evaluated, and the last value is returned as the result of the cond.\n"
 "If the test evaluates to nil, none of the forms are evaluated, and the next argument is processed in the same way.";
-const char doc53[] PROGMEM = "(when test form*)\n"
+const char doc58[] PROGMEM = "(when test form*)\n"
 "Evaluates the test. If it's non-nil the forms are evaluated and the last value is returned.";
-const char doc54[] PROGMEM = "(unless test form*)\n"
+const char doc59[] PROGMEM = "(unless test form*)\n"
 "Evaluates the test. If it's nil the forms are evaluated and the last value is returned.";
-const char doc55[] PROGMEM = "(case keyform ((key form*) (key form*) ... ))\n"
+const char doc60[] PROGMEM = "(case keyform ((key form*) (key form*) ... ))\n"
 "Evaluates a keyform to produce a test key, and then tests this against a series of arguments,\n"
 "each of which is a list containing a key optionally followed by one or more forms.";
-const char doc56[] PROGMEM = "(and item*)\n"
+const char doc61[] PROGMEM = "(and item*)\n"
 "Evaluates its arguments until one returns nil, and returns the last value.";
-const char doc57[] PROGMEM = "(not item)\n"
+const char doc62[] PROGMEM = "(not item)\n"
 "Returns t if its argument is nil, or nil otherwise. Equivalent to null.";
-const char doc59[] PROGMEM = "(cons item item)\n"
+const char doc64[] PROGMEM = "(cons item item)\n"
 "If the second argument is a list, cons returns a new list with item added to the front of the list.\n"
 "If the second argument isn't a list cons returns a dotted pair.";
-const char doc60[] PROGMEM = "(atom item)\n"
+const char doc65[] PROGMEM = "(atom item)\n"
 "Returns t if its argument is a single number, symbol, or nil.";
-const char doc61[] PROGMEM = "(listp item)\n"
+const char doc66[] PROGMEM = "(listp item)\n"
 "Returns t if its argument is a list.";
-const char doc62[] PROGMEM = "(consp item)\n"
+const char doc67[] PROGMEM = "(consp item)\n"
 "Returns t if its argument is a non-null list.";
-const char doc63[] PROGMEM = "(symbolp item)\n"
+const char doc68[] PROGMEM = "(symbolp item)\n"
 "Returns t if its argument is a symbol.";
-const char doc64[] PROGMEM = "(arrayp item)\n"
+const char doc69[] PROGMEM = "(arrayp item)\n"
 "Returns t if its argument is an array.";
-const char doc65[] PROGMEM = "(boundp item)\n"
+const char doc70[] PROGMEM = "(boundp item)\n"
 "Returns t if its argument is a symbol with a value.";
-const char doc66[] PROGMEM = "(keywordp item)\n"
-"Returns t if its argument is a keyword.";
-const char doc67[] PROGMEM = "(set symbol value [symbol value]*)\n"
+const char doc71[] PROGMEM = "(keywordp item)\n"
+"Returns t if its argument is a built-in or user-defined keyword.";
+const char doc72[] PROGMEM = "(set symbol value [symbol value]*)\n"
 "For each pair of arguments, assigns the value of the second argument to the value of the first argument.";
-const char doc68[] PROGMEM = "(streamp item)\n"
+const char doc73[] PROGMEM = "(streamp item)\n"
 "Returns t if its argument is a stream.";
-const char doc69[] PROGMEM = "(eq item item)\n"
+const char doc74[] PROGMEM = "(equal item item)\n"
 "Tests whether the two arguments are the same symbol, same character, equal numbers,\n"
 "or point to the same cons, and returns t or nil as appropriate.";
-const char doc70[] PROGMEM = "(equal item item)\n"
-"Tests whether the two arguments are the same symbol, same character, equal numbers,\n"
-"or point to the same cons, and returns t or nil as appropriate.";
-const char doc71[] PROGMEM = "(caar list)";
-const char doc72[] PROGMEM = "(cadr list)";
-const char doc74[] PROGMEM = "(cdar list)\n"
+const char doc75[] PROGMEM = "(caar list)";
+const char doc76[] PROGMEM = "(cadr list)";
+const char doc78[] PROGMEM = "(cdar list)\n"
 "Equivalent to (cdr (car list)).";
-const char doc75[] PROGMEM = "(cddr list)\n"
+const char doc79[] PROGMEM = "(cddr list)\n"
 "Equivalent to (cdr (cdr list)).";
-const char doc76[] PROGMEM = "(caaar list)\n"
+const char doc80[] PROGMEM = "(caaar list)\n"
 "Equivalent to (car (car (car list))).";
-const char doc77[] PROGMEM = "(caadr list)\n"
+const char doc81[] PROGMEM = "(caadr list)\n"
 "Equivalent to (car (car (cdar list))).";
-const char doc78[] PROGMEM = "(cadar list)\n"
+const char doc82[] PROGMEM = "(cadar list)\n"
 "Equivalent to (car (cdr (car list))).";
-const char doc79[] PROGMEM = "(caddr list)\n"
+const char doc83[] PROGMEM = "(caddr list)\n"
 "Equivalent to (car (cdr (cdr list))).";
-const char doc81[] PROGMEM = "(cdaar list)\n"
+const char doc85[] PROGMEM = "(cdaar list)\n"
 "Equivalent to (cdar (car (car list))).";
-const char doc82[] PROGMEM = "(cdadr list)\n"
+const char doc86[] PROGMEM = "(cdadr list)\n"
 "Equivalent to (cdr (car (cdr list))).";
-const char doc83[] PROGMEM = "(cddar list)\n"
+const char doc87[] PROGMEM = "(cddar list)\n"
 "Equivalent to (cdr (cdr (car list))).";
-const char doc84[] PROGMEM = "(cdddr list)\n"
+const char doc88[] PROGMEM = "(cdddr list)\n"
 "Equivalent to (cdr (cdr (cdr list))).";
-const char doc85[] PROGMEM = "(length item)\n"
+const char doc89[] PROGMEM = "(length item)\n"
 "Returns the number of items in a list, the length of a string, or the length of a one-dimensional array.";
-const char doc86[] PROGMEM = "(array-dimensions item)\n"
+const char doc90[] PROGMEM = "(array-dimensions item)\n"
 "Returns a list of the dimensions of an array.";
-const char doc87[] PROGMEM = "(list item*)\n"
+const char doc91[] PROGMEM = "(list item*)\n"
 "Returns a list of the values of its arguments.";
-const char doc88[] PROGMEM = "(make-array size [:initial-element element] [:element-type 'bit])\n"
+const char doc92[] PROGMEM = "(copy-list list)\n"
+"Returns a copy of a list.";
+const char doc93[] PROGMEM = "(make-array size [:initial-element element] [:element-type 'bit])\n"
 "If size is an integer it creates a one-dimensional array with elements from 0 to size-1.\n"
 "If size is a list of n integers it creates an n-dimensional array with those dimensions.\n"
 "If :element-type 'bit is specified the array is a bit array.";
-const char doc89[] PROGMEM = "(reverse list)\n"
+const char doc94[] PROGMEM = "(reverse list)\n"
 "Returns a list with the elements of list in reverse order.";
-const char doc90[] PROGMEM = "(assoc key list)\n"
-"Looks up a key in an association list of (key . value) pairs,\n"
+const char doc95[] PROGMEM = "(assoc key list [:test function])\n"
+"Looks up a key in an association list of (key . value) pairs, using eq or the specified test function,\n"
 "and returns the matching pair, or nil if no pair is found.";
-const char doc91[] PROGMEM = "(member item list)\n"
-"Searches for an item in a list, using eq, and returns the list starting from the first occurrence of the item,\n"
-"or nil if it is not found.";
-const char doc92[] PROGMEM = "(apply function list)\n"
+const char doc96[] PROGMEM = "(member item list [:test function])\n"
+"Searches for an item in a list, using eq or the specified test function, and returns the list starting\n"
+"from the first occurrence of the item, or nil if it is not found.";
+const char doc97[] PROGMEM = "(apply function list)\n"
 "Returns the result of evaluating function, with the list of arguments specified by the second parameter.";
-const char doc93[] PROGMEM = "(funcall function argument*)\n"
+const char doc98[] PROGMEM = "(funcall function argument*)\n"
 "Evaluates function with the specified arguments.";
-const char doc94[] PROGMEM = "(append list*)\n"
+const char doc99[] PROGMEM = "(append list*)\n"
 "Joins its arguments, which should be lists, into a single list.";
-const char doc95[] PROGMEM = "(mapc function list1 [list]*)\n"
+const char doc100[] PROGMEM = "(mapc function list1 [list]*)\n"
 "Applies the function to each element in one or more lists, ignoring the results.\n"
 "It returns the first list argument.";
-const char doc96[] PROGMEM = "(mapcar function list1 [list]*)\n"
+const char doc101[] PROGMEM = "(mapl function list1 [list]*)\n"
+"Applies the function to one or more lists and then successive cdrs of those lists,\n"
+"ignoring the results. It returns the first list argument.";
+const char doc102[] PROGMEM = "(mapcar function list1 [list]*)\n"
 "Applies the function to each element in one or more lists, and returns the resulting list.";
-const char doc97[] PROGMEM = "(mapcan function list1 [list]*)\n"
+const char doc103[] PROGMEM = "(mapcan function list1 [list]*)\n"
 "Applies the function to each element in one or more lists. The results should be lists,\n"
-"and these are appended together to give the value returned.";
-const char doc98[] PROGMEM = "(+ number*)\n"
+"and these are destructively concatenated together to give the value returned.";
+const char doc104[] PROGMEM = "(maplist function list1 [list]*)\n"
+"Applies the function to one or more lists and then successive cdrs of those lists,\n"
+"and returns the resulting list.";
+const char doc105[] PROGMEM = "(mapcon function list1 [list]*)\n"
+"Applies the function to one or more lists and then successive cdrs of those lists,\n"
+"and these are destructively concatenated together to give the value returned.";
+const char doc106[] PROGMEM = "(+ number*)\n"
 "Adds its arguments together.";
-const char doc99[] PROGMEM = "(- number*)\n"
+const char doc107[] PROGMEM = "(- number*)\n"
 "If there is one argument, negates the argument.\n"
 "If there are two or more arguments, subtracts the second and subsequent arguments from the first argument.";
-const char doc100[] PROGMEM = "(* number*)\n"
+const char doc108[] PROGMEM = "(* number*)\n"
 "Multiplies its arguments together.";
-const char doc101[] PROGMEM = "(/ number*)\n"
+const char doc109[] PROGMEM = "(/ number*)\n"
 "Divides the first argument by the second and subsequent arguments.";
-const char doc103[] PROGMEM = "(mod number number)\n"
+const char doc111[] PROGMEM = "(mod number number)\n"
 "Returns its first argument modulo the second argument.";
-const char doc104[] PROGMEM = "(1+ number)\n"
+const char doc112[] PROGMEM = "(1+ number)\n"
 "Adds one to its argument and returns it.";
-const char doc105[] PROGMEM = "(1- number)\n"
+const char doc113[] PROGMEM = "(1- number)\n"
 "Subtracts one from its argument and returns it.";
-const char doc106[] PROGMEM = "(abs number)\n"
+const char doc114[] PROGMEM = "(abs number)\n"
 "Returns the absolute, positive value of its argument.";
-const char doc107[] PROGMEM = "(random number)\n"
+const char doc115[] PROGMEM = "(random number)\n"
 "Returns a random number between 0 and one less than its argument.";
-const char doc108[] PROGMEM = "(max number*)\n"
+const char doc116[] PROGMEM = "(max number*)\n"
 "Returns the maximum of one or more arguments.";
-const char doc109[] PROGMEM = "(min number*)\n"
+const char doc117[] PROGMEM = "(min number*)\n"
 "Returns the minimum of one or more arguments.";
-const char doc110[] PROGMEM = "(/= number*)\n"
+const char doc118[] PROGMEM = "(/= number*)\n"
 "Returns t if none of the arguments are equal, or nil if two or more arguments are equal.";
-const char doc111[] PROGMEM = "(= number*)\n"
+const char doc119[] PROGMEM = "(= number*)\n"
 "Returns t if all the arguments, which must be numbers, are numerically equal, and nil otherwise.";
-const char doc112[] PROGMEM = "(< number*)\n"
+const char doc120[] PROGMEM = "(< number*)\n"
 "Returns t if each argument is less than the next argument, and nil otherwise.";
-const char doc113[] PROGMEM = "(<= number*)\n"
+const char doc121[] PROGMEM = "(<= number*)\n"
 "Returns t if each argument is less than or equal to the next argument, and nil otherwise.";
-const char doc114[] PROGMEM = "(> number*)\n"
+const char doc122[] PROGMEM = "(> number*)\n"
 "Returns t if each argument is greater than the next argument, and nil otherwise.";
-const char doc115[] PROGMEM = "(>= number*)\n"
+const char doc123[] PROGMEM = "(>= number*)\n"
 "Returns t if each argument is greater than or equal to the next argument, and nil otherwise.";
-const char doc116[] PROGMEM = "(plusp number)\n"
+const char doc124[] PROGMEM = "(plusp number)\n"
 "Returns t if the argument is greater than zero, or nil otherwise.";
-const char doc118[] PROGMEM = "(zerop number)\n"
+const char doc126[] PROGMEM = "(zerop number)\n"
 "Returns t if the argument is zero.";
-const char doc119[] PROGMEM = "(oddp number)\n"
+const char doc127[] PROGMEM = "(oddp number)\n"
 "Returns t if the integer argument is odd.";
-const char doc120[] PROGMEM = "(evenp number)\n"
+const char doc128[] PROGMEM = "(evenp number)\n"
 "Returns t if the integer argument is even.";
-const char doc121[] PROGMEM = "(integerp number)\n"
+const char doc129[] PROGMEM = "(integerp number)\n"
 "Returns t if the argument is an integer.";
-const char doc123[] PROGMEM = "(char string n)\n"
-"Returns the nth character in a string, counting from zero.";
-const char doc124[] PROGMEM = "(char-code character)\n"
+const char doc131[] PROGMEM = "(char-code character)\n"
 "Returns the ASCII code for a character, as an integer.";
-const char doc125[] PROGMEM = "(code-char integer)\n"
+const char doc132[] PROGMEM = "(code-char integer)\n"
 "Returns the character for the specified ASCII code.";
-const char doc126[] PROGMEM = "(characterp item)\n"
+const char doc133[] PROGMEM = "(characterp item)\n"
 "Returns t if the argument is a character and nil otherwise.";
-const char doc127[] PROGMEM = "(stringp item)\n"
+const char doc134[] PROGMEM = "(stringp item)\n"
 "Returns t if the argument is a string and nil otherwise.";
-const char doc128[] PROGMEM = "(string= string string)\n"
-"Tests whether two strings are the same.";
-const char doc129[] PROGMEM = "(string< string string)\n"
-"Returns t if the first string is alphabetically less than the second string, and nil otherwise.";
-const char doc130[] PROGMEM = "(string> string string)\n"
-"Returns t if the first string is alphabetically greater than the second string, and nil otherwise.";
-const char doc131[] PROGMEM = "(sort list test)\n"
+const char doc135[] PROGMEM = "(string= string string)\n"
+"Returns t if the two strings are the same, or nil otherwise.";
+const char doc136[] PROGMEM = "(string< string string)\n"
+"Returns the index to the first mismatch if the first string is alphabetically less than the second string,\n"
+"or nil otherwise.";
+const char doc137[] PROGMEM = "(string> string string)\n"
+"Returns the index to the first mismatch if the first string is alphabetically greater than the second string,\n"
+"or nil otherwise.";
+const char doc138[] PROGMEM = "(string/= string string)\n"
+"Returns the index to the first mismatch if the two strings are not the same, or nil otherwise.";
+const char doc139[] PROGMEM = "(string<= string string)\n"
+"Returns the index to the first mismatch if the first string is alphabetically less than or equal to\n"
+"the second string, or nil otherwise.";
+const char doc140[] PROGMEM = "(string>= string string)\n"
+"Returns the index to the first mismatch if the first string is alphabetically greater than or equal to\n"
+"the second string, or nil otherwise.";
+const char doc141[] PROGMEM = "(sort list test)\n"
 "Destructively sorts list according to the test function, using an insertion sort, and returns the sorted list.";
-const char doc132[] PROGMEM = "(concatenate 'string string*)\n"
+const char doc142[] PROGMEM = "(concatenate 'string string*)\n"
 "Joins together the strings given in the second and subsequent arguments, and returns a single string.";
-const char doc133[] PROGMEM = "(subseq seq start [end])\n"
+const char doc143[] PROGMEM = "(subseq seq start [end])\n"
 "Returns a subsequence of a list or string from item start to item end-1.";
-const char doc134[] PROGMEM = "(search pattern target)\n"
-"Returns the index of the first occurrence of pattern in target,\n"
-"which can be lists or strings, or nil if it's not found.";
-const char doc135[] PROGMEM = "(read-from-string string)\n"
+const char doc144[] PROGMEM = "(search pattern target [:test function])\n"
+"Returns the index of the first occurrence of pattern in target, or nil if it's not found.\n"
+"The target can be a list or string. If it's a list a test function can be specified; default eq.";
+const char doc145[] PROGMEM = "(read-from-string string)\n"
 "Reads an atom or list from the specified string and returns it.";
-const char doc136[] PROGMEM = "(princ-to-string item)\n"
+const char doc146[] PROGMEM = "(princ-to-string item)\n"
 "Prints its argument to a string, and returns the string.\n"
 "Characters and strings are printed without quotation marks or escape characters.";
-const char doc137[] PROGMEM = "(prin1-to-string item [stream])\n"
+const char doc147[] PROGMEM = "(prin1-to-string item [stream])\n"
 "Prints its argument to a string, and returns the string.\n"
 "Characters and strings are printed with quotation marks and escape characters,\n"
 "in a format that will be suitable for read-from-string.";
-const char doc138[] PROGMEM = "(logand [value*])\n"
+const char doc148[] PROGMEM = "(logand [value*])\n"
 "Returns the bitwise & of the values.";
-const char doc139[] PROGMEM = "(logior [value*])\n"
+const char doc149[] PROGMEM = "(logior [value*])\n"
 "Returns the bitwise | of the values.";
-const char doc140[] PROGMEM = "(logxor [value*])\n"
+const char doc150[] PROGMEM = "(logxor [value*])\n"
 "Returns the bitwise ^ of the values.";
-const char doc141[] PROGMEM = "(lognot value)\n"
+const char doc151[] PROGMEM = "(lognot value)\n"
 "Returns the bitwise logical NOT of the value.";
-const char doc142[] PROGMEM = "(ash value shift)\n"
+const char doc152[] PROGMEM = "(ash value shift)\n"
 "Returns the result of bitwise shifting value by shift bits. If shift is positive, value is shifted to the left.";
-const char doc143[] PROGMEM = "(logbitp bit value)\n"
+const char doc153[] PROGMEM = "(logbitp bit value)\n"
 "Returns t if bit number bit in value is a '1', and nil if it is a '0'.";
-const char doc144[] PROGMEM = "(eval form*)\n"
+const char doc154[] PROGMEM = "(eval form*)\n"
 "Evaluates its argument an extra time.";
-const char doc145[] PROGMEM = "(globals)\n"
+const char doc155[] PROGMEM = "(return [value])\n"
+"Exits from a (dotimes ...), (dolist ...), or (loop ...) loop construct and returns value.";
+const char doc156[] PROGMEM = "(globals)\n"
 "Returns a list of global variables.";
-const char doc146[] PROGMEM = "(locals)\n"
+const char doc157[] PROGMEM = "(locals)\n"
 "Returns an association list of local variables and their values.";
-const char doc147[] PROGMEM = "(makunbound symbol)\n"
+const char doc158[] PROGMEM = "(makunbound symbol)\n"
 "Removes the value of the symbol from GlobalEnv and returns the symbol.";
-const char doc148[] PROGMEM = "(break)\n"
+const char doc159[] PROGMEM = "(break)\n"
 "Inserts a breakpoint in the program. When evaluated prints Break! and reenters the REPL.";
-const char doc149[] PROGMEM = "(read [stream])\n"
+const char doc160[] PROGMEM = "(read [stream])\n"
 "Reads an atom or list from the serial input and returns it.\n"
 "If stream is specified the item is read from the specified stream.";
-const char doc150[] PROGMEM = "(prin1 item [stream])\n"
+const char doc161[] PROGMEM = "(prin1 item [stream])\n"
 "Prints its argument, and returns its value.\n"
 "Strings are printed with quotation marks and escape characters.";
-const char doc151[] PROGMEM = "(print item [stream])\n"
+const char doc162[] PROGMEM = "(print item [stream])\n"
 "Prints its argument with quotation marks and escape characters, on a new line, and followed by a space.\n"
 "If stream is specified the argument is printed to the specified stream.";
-const char doc152[] PROGMEM = "(princ item [stream])\n"
+const char doc163[] PROGMEM = "(princ item [stream])\n"
 "Prints its argument, and returns its value.\n"
 "Characters and strings are printed without quotation marks or escape characters.";
-const char doc153[] PROGMEM = "(terpri [stream])\n"
+const char doc164[] PROGMEM = "(terpri [stream])\n"
 "Prints a new line, and returns nil.\n"
 "If stream is specified the new line is written to the specified stream.";
-const char doc154[] PROGMEM = "(read-byte stream)\n"
+const char doc165[] PROGMEM = "(read-byte stream)\n"
 "Reads a byte from a stream and returns it.";
-const char doc155[] PROGMEM = "(read-line [stream])\n"
+const char doc166[] PROGMEM = "(read-line [stream])\n"
 "Reads characters from the serial input up to a newline character, and returns them as a string, excluding the newline.\n"
 "If stream is specified the line is read from the specified stream.";
-const char doc156[] PROGMEM = "(write-byte number [stream])\n"
+const char doc167[] PROGMEM = "(write-byte number [stream])\n"
 "Writes a byte to a stream.";
-const char doc157[] PROGMEM = "(write-string string [stream])\n"
+const char doc168[] PROGMEM = "(write-string string [stream])\n"
 "Writes a string. If stream is specified the string is written to the stream.";
-const char doc158[] PROGMEM = "(write-line string [stream])\n"
+const char doc169[] PROGMEM = "(write-line string [stream])\n"
 "Writes a string terminated by a newline character. If stream is specified the string is written to the stream.";
-const char doc159[] PROGMEM = "(restart-i2c stream [read-p])\n"
+const char doc170[] PROGMEM = "(restart-i2c stream [read-p])\n"
 "Restarts an i2c-stream.\n"
 "If read-p is nil or omitted the stream is written to.\n"
 "If read-p is an integer it specifies the number of bytes to be read from the stream.";
-const char doc160[] PROGMEM = "(gc)\n"
+const char doc171[] PROGMEM = "(gc)\n"
 "Forces a garbage collection and prints the number of objects collected, and the time taken.";
-const char doc161[] PROGMEM = "(room)\n"
+const char doc172[] PROGMEM = "(room)\n"
 "Returns the number of free Lisp cells remaining.";
-const char doc162[] PROGMEM = "(save-image [symbol])\n"
+const char doc173[] PROGMEM = "(save-image [symbol])\n"
 "Saves the current uLisp image to non-volatile memory or SD card so it can be loaded using load-image.";
-const char doc163[] PROGMEM = "(load-image [filename])\n"
+const char doc174[] PROGMEM = "(load-image [filename])\n"
 "Loads a saved uLisp image from non-volatile memory or SD card.";
-const char doc164[] PROGMEM = "(cls)\n"
+const char doc175[] PROGMEM = "(cls)\n"
 "Prints a clear-screen character.";
-const char doc165[] PROGMEM = "(digitalread pin)\n"
+const char doc176[] PROGMEM = "(digitalread pin)\n"
 "Reads the state of the specified Arduino pin number and returns t (high) or nil (low).";
-const char doc166[] PROGMEM = "(analogreadresolution bits)\n"
+const char doc177[] PROGMEM = "(analogreadresolution bits)\n"
 "Specifies the resolution for the analogue inputs on platforms that support it.\n"
 "The default resolution on all platforms is 10 bits.";
-const char doc167[] PROGMEM = "(analogwrite pin value)\n"
+const char doc178[] PROGMEM = "(analogwrite pin value)\n"
 "Writes the value to the specified Arduino pin number.";
-const char doc168[] PROGMEM = "(dacreference value)\n"
+const char doc179[] PROGMEM = "(dacreference value)\n"
 "Sets the DAC voltage reference. AVR128DX48 only.";
-const char doc169[] PROGMEM = "(delay number)\n"
+const char doc180[] PROGMEM = "(delay number)\n"
 "Delays for a specified number of milliseconds.";
-const char doc170[] PROGMEM = "(millis)\n"
+const char doc181[] PROGMEM = "(millis)\n"
 "Returns the time in milliseconds that uLisp has been running.";
-const char doc171[] PROGMEM = "(sleep secs)\n"
+const char doc182[] PROGMEM = "(sleep secs)\n"
 "Puts the processor into a low-power sleep mode for secs.\n"
 "Only supported on some platforms. On other platforms it does delay(1000*secs).";
-const char doc172[] PROGMEM = "(note [pin] [note] [octave])\n"
+const char doc183[] PROGMEM = "(note [pin] [note] [octave])\n"
 "Generates a square wave on pin.\n"
-"The argument note represents the note in the well-tempered scale, from 0 to 11,\n"
-"where 0 represents C, 1 represents C#, and so on.\n"
-"The argument octave can be from 3 to 6. If omitted it defaults to 0.";
-const char doc173[] PROGMEM = "(edit 'function)\n"
+"note represents the note in the well-tempered scale.\n"
+"The argument octave can specify an octave; default 0.";
+const char doc184[] PROGMEM = "(edit 'function)\n"
 "Calls the Lisp tree editor to allow you to edit a function definition.";
-const char doc174[] PROGMEM = "(pprint item [str])\n"
+const char doc185[] PROGMEM = "(pprint item [str])\n"
 "Prints its argument, using the pretty printer, to display it formatted in a structured way.\n"
 "If str is specified it prints to the specified stream. It returns no value.";
-const char doc175[] PROGMEM = "(pprintall [str])\n"
+const char doc186[] PROGMEM = "(pprintall [str])\n"
 "Pretty-prints the definition of every function and variable defined in the uLisp workspace.\n"
 "If str is specified it prints to the specified stream. It returns no value.";
-const char doc176[] PROGMEM = "(require 'symbol)\n"
+const char doc187[] PROGMEM = "(require 'symbol)\n"
 "Loads the definition of a function defined with defun, or a variable defined with defvar, from the Lisp Library.\n"
 "It returns t if it was loaded, or nil if the symbol is already defined or isn't defined in the Lisp Library.";
-const char doc177[] PROGMEM = "(list-library)\n"
+const char doc188[] PROGMEM = "(list-library)\n"
 "Prints a list of the functions defined in the List Library.";
-const char doc178[] PROGMEM = "(? item)\n"
+const char doc189[] PROGMEM = "(? item)\n"
 "Prints the documentation string of a built-in or user-defined function.";
-const char doc179[] PROGMEM = "(documentation 'symbol [type])\n"
+const char doc190[] PROGMEM = "(documentation 'symbol [type])\n"
 "Returns the documentation string of a built-in or user-defined function. The type argument is ignored.";
-const char doc180[] PROGMEM = "(apropos item)\n"
+const char doc191[] PROGMEM = "(apropos item)\n"
 "Prints the user-defined and built-in functions whose names contain the specified string or symbol.";
-const char doc181[] PROGMEM = "(apropos-list item)\n"
+const char doc192[] PROGMEM = "(apropos-list item)\n"
 "Returns a list of user-defined and built-in functions whose names contain the specified string or symbol.";
-const char doc182[] PROGMEM = "(unwind-protect form1 [forms]*)\n"
+const char doc193[] PROGMEM = "(unwind-protect form1 [forms]*)\n"
 "Evaluates form1 and forms in order and returns the value of form1,\n"
 "but guarantees to evaluate forms even if an error occurs in form1.";
-const char doc183[] PROGMEM = "(ignore-errors [forms]*)\n"
+const char doc194[] PROGMEM = "(ignore-errors [forms]*)\n"
 "Evaluates forms ignoring errors.";
-const char doc184[] PROGMEM = "(error controlstring [arguments]*)\n"
+const char doc195[] PROGMEM = "(error controlstring [arguments]*)\n"
 "Signals an error. The message is printed by format using the controlstring and arguments.";
 const char docG1[] PROGMEM = "(draw-pixel x y [colour])\n"
 "Draws a pixel at coordinates (x,y) in colour, or white if omitted.";
@@ -4951,187 +5082,198 @@ const tbl_entry_t lookup_table[] PROGMEM = {
   { string1, NULL, 0000, doc1 },
   { string2, NULL, 0000, doc2 },
   { string3, NULL, 0000, doc3 },
-  { string4, NULL, 0000, NULL },
+  { string4, NULL, 0000, doc4 },
   { string5, NULL, 0000, NULL },
   { string6, NULL, 0000, NULL },
-  { string7, NULL, 0000, doc7 },
-  { string8, NULL, 0017, doc8 },
-  { string9, NULL, 0017, doc9 },
+  { string7, NULL, 0000, NULL },
+  { string8, NULL, 0000, NULL },
+  { string9, NULL, 0000, doc9 },
   { string10, NULL, 0017, doc10 },
-  { string11, NULL, 0017, NULL },
-  { string12, NULL, 0007, NULL },
-  { string13, sp_quote, 0311, NULL },
-  { string14, sp_defun, 0327, doc14 },
-  { string15, sp_defvar, 0313, doc15 },
-  { string16, sp_defcode, 0307, doc16 },
-  { string17, fn_car, 0211, doc17 },
-  { string18, fn_car, 0211, NULL },
-  { string19, fn_cdr, 0211, doc19 },
-  { string20, fn_cdr, 0211, NULL },
-  { string21, fn_nth, 0222, doc21 },
-  { string22, fn_aref, 0227, doc22 },
-  { string23, fn_stringfn, 0211, doc23 },
-  { string24, fn_pinmode, 0222, doc24 },
-  { string25, fn_digitalwrite, 0222, doc25 },
-  { string26, fn_analogread, 0211, doc26 },
-  { string27, fn_analogreference, 0211, doc27 },
-  { string28, fn_register, 0212, doc28 },
-  { string29, fn_format, 0227, doc29 },
-  { string30, sp_or, 0307, doc30 },
-  { string31, sp_setq, 0327, doc31 },
-  { string32, sp_loop, 0307, doc32 },
-  { string33, sp_return, 0307, doc33 },
-  { string34, sp_push, 0322, doc34 },
-  { string35, sp_pop, 0311, doc35 },
-  { string36, sp_incf, 0312, doc36 },
-  { string37, sp_decf, 0312, doc37 },
-  { string38, sp_setf, 0327, doc38 },
-  { string39, sp_dolist, 0317, doc39 },
-  { string40, sp_dotimes, 0317, doc40 },
-  { string41, sp_trace, 0301, doc41 },
-  { string42, sp_untrace, 0301, doc42 },
-  { string43, sp_formillis, 0317, doc43 },
-  { string44, sp_time, 0311, doc44 },
-  { string45, sp_withoutputtostring, 0317, doc45 },
-  { string46, sp_withserial, 0317, doc46 },
-  { string47, sp_withi2c, 0317, doc47 },
-  { string48, sp_withspi, 0317, doc48 },
-  { string49, sp_withsdcard, 0327, doc49 },
-  { string50, tf_progn, 0107, doc50 },
-  { string51, tf_if, 0123, doc51 },
-  { string52, tf_cond, 0107, doc52 },
-  { string53, tf_when, 0117, doc53 },
-  { string54, tf_unless, 0117, doc54 },
-  { string55, tf_case, 0117, doc55 },
-  { string56, tf_and, 0107, doc56 },
-  { string57, fn_not, 0211, doc57 },
-  { string58, fn_not, 0211, NULL },
-  { string59, fn_cons, 0222, doc59 },
-  { string60, fn_atom, 0211, doc60 },
-  { string61, fn_listp, 0211, doc61 },
-  { string62, fn_consp, 0211, doc62 },
-  { string63, fn_symbolp, 0211, doc63 },
-  { string64, fn_arrayp, 0211, doc64 },
-  { string65, fn_boundp, 0211, doc65 },
-  { string66, fn_keywordp, 0211, doc66 },
-  { string67, fn_setfn, 0227, doc67 },
-  { string68, fn_streamp, 0211, doc68 },
-  { string69, fn_eq, 0222, doc69 },
-  { string70, fn_equal, 0222, doc70 },
-  { string71, fn_caar, 0211, doc71 },
-  { string72, fn_cadr, 0211, doc72 },
-  { string73, fn_cadr, 0211, NULL },
-  { string74, fn_cdar, 0211, doc74 },
-  { string75, fn_cddr, 0211, doc75 },
-  { string76, fn_caaar, 0211, doc76 },
-  { string77, fn_caadr, 0211, doc77 },
-  { string78, fn_cadar, 0211, doc78 },
-  { string79, fn_caddr, 0211, doc79 },
-  { string80, fn_caddr, 0211, NULL },
-  { string81, fn_cdaar, 0211, doc81 },
-  { string82, fn_cdadr, 0211, doc82 },
-  { string83, fn_cddar, 0211, doc83 },
-  { string84, fn_cdddr, 0211, doc84 },
-  { string85, fn_length, 0211, doc85 },
-  { string86, fn_arraydimensions, 0211, doc86 },
-  { string87, fn_list, 0207, doc87 },
-  { string88, fn_makearray, 0215, doc88 },
-  { string89, fn_reverse, 0211, doc89 },
-  { string90, fn_assoc, 0222, doc90 },
-  { string91, fn_member, 0222, doc91 },
-  { string92, fn_apply, 0227, doc92 },
-  { string93, fn_funcall, 0217, doc93 },
-  { string94, fn_append, 0207, doc94 },
-  { string95, fn_mapc, 0227, doc95 },
-  { string96, fn_mapcar, 0227, doc96 },
-  { string97, fn_mapcan, 0227, doc97 },
-  { string98, fn_add, 0207, doc98 },
-  { string99, fn_subtract, 0217, doc99 },
-  { string100, fn_multiply, 0207, doc100 },
-  { string101, fn_divide, 0227, doc101 },
-  { string102, fn_divide, 0212, NULL },
-  { string103, fn_mod, 0222, doc103 },
-  { string104, fn_oneplus, 0211, doc104 },
-  { string105, fn_oneminus, 0211, doc105 },
-  { string106, fn_abs, 0211, doc106 },
-  { string107, fn_random, 0211, doc107 },
-  { string108, fn_maxfn, 0217, doc108 },
-  { string109, fn_minfn, 0217, doc109 },
-  { string110, fn_noteq, 0217, doc110 },
-  { string111, fn_numeq, 0217, doc111 },
-  { string112, fn_less, 0217, doc112 },
-  { string113, fn_lesseq, 0217, doc113 },
-  { string114, fn_greater, 0217, doc114 },
-  { string115, fn_greatereq, 0217, doc115 },
-  { string116, fn_plusp, 0211, doc116 },
-  { string117, fn_minusp, 0211, NULL },
-  { string118, fn_zerop, 0211, doc118 },
-  { string119, fn_oddp, 0211, doc119 },
-  { string120, fn_evenp, 0211, doc120 },
-  { string121, fn_integerp, 0211, doc121 },
-  { string122, fn_integerp, 0211, NULL },
-  { string123, fn_char, 0222, doc123 },
-  { string124, fn_charcode, 0211, doc124 },
-  { string125, fn_codechar, 0211, doc125 },
-  { string126, fn_characterp, 0211, doc126 },
-  { string127, fn_stringp, 0211, doc127 },
-  { string128, fn_stringeq, 0222, doc128 },
-  { string129, fn_stringless, 0222, doc129 },
-  { string130, fn_stringgreater, 0222, doc130 },
-  { string131, fn_sort, 0222, doc131 },
-  { string132, fn_concatenate, 0217, doc132 },
-  { string133, fn_subseq, 0223, doc133 },
-  { string134, fn_search, 0222, doc134 },
-  { string135, fn_readfromstring, 0211, doc135 },
-  { string136, fn_princtostring, 0211, doc136 },
-  { string137, fn_prin1tostring, 0211, doc137 },
-  { string138, fn_logand, 0207, doc138 },
-  { string139, fn_logior, 0207, doc139 },
-  { string140, fn_logxor, 0207, doc140 },
-  { string141, fn_lognot, 0211, doc141 },
-  { string142, fn_ash, 0222, doc142 },
-  { string143, fn_logbitp, 0222, doc143 },
-  { string144, fn_eval, 0211, doc144 },
-  { string145, fn_globals, 0200, doc145 },
-  { string146, fn_locals, 0200, doc146 },
-  { string147, fn_makunbound, 0211, doc147 },
-  { string148, fn_break, 0200, doc148 },
-  { string149, fn_read, 0201, doc149 },
-  { string150, fn_prin1, 0212, doc150 },
-  { string151, fn_print, 0212, doc151 },
-  { string152, fn_princ, 0212, doc152 },
-  { string153, fn_terpri, 0201, doc153 },
-  { string154, fn_readbyte, 0202, doc154 },
-  { string155, fn_readline, 0201, doc155 },
-  { string156, fn_writebyte, 0212, doc156 },
-  { string157, fn_writestring, 0212, doc157 },
-  { string158, fn_writeline, 0212, doc158 },
-  { string159, fn_restarti2c, 0212, doc159 },
-  { string160, fn_gc, 0200, doc160 },
-  { string161, fn_room, 0200, doc161 },
-  { string162, fn_saveimage, 0201, doc162 },
-  { string163, fn_loadimage, 0201, doc163 },
-  { string164, fn_cls, 0200, doc164 },
-  { string165, fn_digitalread, 0211, doc165 },
-  { string166, fn_analogreadresolution, 0211, doc166 },
-  { string167, fn_analogwrite, 0222, doc167 },
-  { string168, fn_dacreference, 0211, doc168 },
-  { string169, fn_delay, 0211, doc169 },
-  { string170, fn_millis, 0200, doc170 },
-  { string171, fn_sleep, 0201, doc171 },
-  { string172, fn_note, 0203, doc172 },
-  { string173, fn_edit, 0211, doc173 },
-  { string174, fn_pprint, 0212, doc174 },
-  { string175, fn_pprintall, 0201, doc175 },
-  { string176, fn_require, 0211, doc176 },
-  { string177, fn_listlibrary, 0200, doc177 },
-  { string178, sp_help, 0311, doc178 },
-  { string179, fn_documentation, 0212, doc179 },
-  { string180, fn_apropos, 0211, doc180 },
-  { string181, fn_aproposlist, 0211, doc181 },
-  { string182, sp_unwindprotect, 0307, doc182 },
-  { string183, sp_ignoreerrors, 0307, doc183 },
-  { string184, sp_error, 0317, doc184 },  
+  { string11, NULL, 0017, doc11 },
+  { string12, NULL, 0017, doc12 },
+  { string13, NULL, 0017, NULL },
+  { string14, NULL, 0007, NULL },
+  { string15, sp_quote, 0311, NULL },
+  { string16, sp_defun, 0327, doc16 },
+  { string17, sp_defvar, 0313, doc17 },
+  { string18, sp_defcode, 0307, doc18 },
+  { string19, fn_eq, 0222, doc19 },
+  { string20, fn_car, 0211, doc20 },
+  { string21, fn_car, 0211, NULL },
+  { string22, fn_cdr, 0211, doc22 },
+  { string23, fn_cdr, 0211, NULL },
+  { string24, fn_nth, 0222, doc24 },
+  { string25, fn_aref, 0227, doc25 },
+  { string26, fn_char, 0222, doc26 },
+  { string27, fn_stringfn, 0211, doc27 },
+  { string28, fn_pinmode, 0222, doc28 },
+  { string29, fn_digitalwrite, 0222, doc29 },
+  { string30, fn_analogread, 0211, doc30 },
+  { string31, fn_analogreference, 0211, doc31 },
+  { string32, fn_register, 0212, doc32 },
+  { string33, fn_format, 0227, doc33 },
+  { string34, sp_or, 0307, doc34 },
+  { string35, sp_setq, 0327, doc35 },
+  { string36, sp_loop, 0307, doc36 },
+  { string37, sp_push, 0322, doc37 },
+  { string38, sp_pop, 0311, doc38 },
+  { string39, sp_incf, 0312, doc39 },
+  { string40, sp_decf, 0312, doc40 },
+  { string41, sp_setf, 0327, doc41 },
+  { string42, sp_dolist, 0317, doc42 },
+  { string43, sp_dotimes, 0317, doc43 },
+  { string44, sp_do, 0327, doc44 },
+  { string45, sp_dostar, 0317, doc45 },
+  { string46, sp_trace, 0301, doc46 },
+  { string47, sp_untrace, 0301, doc47 },
+  { string48, sp_formillis, 0317, doc48 },
+  { string49, sp_time, 0311, doc49 },
+  { string50, sp_withoutputtostring, 0317, doc50 },
+  { string51, sp_withserial, 0317, doc51 },
+  { string52, sp_withi2c, 0317, doc52 },
+  { string53, sp_withspi, 0317, doc53 },
+  { string54, sp_withsdcard, 0327, doc54 },
+  { string55, tf_progn, 0107, doc55 },
+  { string56, tf_if, 0123, doc56 },
+  { string57, tf_cond, 0107, doc57 },
+  { string58, tf_when, 0117, doc58 },
+  { string59, tf_unless, 0117, doc59 },
+  { string60, tf_case, 0117, doc60 },
+  { string61, tf_and, 0107, doc61 },
+  { string62, fn_not, 0211, doc62 },
+  { string63, fn_not, 0211, NULL },
+  { string64, fn_cons, 0222, doc64 },
+  { string65, fn_atom, 0211, doc65 },
+  { string66, fn_listp, 0211, doc66 },
+  { string67, fn_consp, 0211, doc67 },
+  { string68, fn_symbolp, 0211, doc68 },
+  { string69, fn_arrayp, 0211, doc69 },
+  { string70, fn_boundp, 0211, doc70 },
+  { string71, fn_keywordp, 0211, doc71 },
+  { string72, fn_setfn, 0227, doc72 },
+  { string73, fn_streamp, 0211, doc73 },
+  { string74, fn_equal, 0222, doc74 },
+  { string75, fn_caar, 0211, doc75 },
+  { string76, fn_cadr, 0211, doc76 },
+  { string77, fn_cadr, 0211, NULL },
+  { string78, fn_cdar, 0211, doc78 },
+  { string79, fn_cddr, 0211, doc79 },
+  { string80, fn_caaar, 0211, doc80 },
+  { string81, fn_caadr, 0211, doc81 },
+  { string82, fn_cadar, 0211, doc82 },
+  { string83, fn_caddr, 0211, doc83 },
+  { string84, fn_caddr, 0211, NULL },
+  { string85, fn_cdaar, 0211, doc85 },
+  { string86, fn_cdadr, 0211, doc86 },
+  { string87, fn_cddar, 0211, doc87 },
+  { string88, fn_cdddr, 0211, doc88 },
+  { string89, fn_length, 0211, doc89 },
+  { string90, fn_arraydimensions, 0211, doc90 },
+  { string91, fn_list, 0207, doc91 },
+  { string92, fn_copylist, 0211, doc92 },
+  { string93, fn_makearray, 0215, doc93 },
+  { string94, fn_reverse, 0211, doc94 },
+  { string95, fn_assoc, 0224, doc95 },
+  { string96, fn_member, 0224, doc96 },
+  { string97, fn_apply, 0227, doc97 },
+  { string98, fn_funcall, 0217, doc98 },
+  { string99, fn_append, 0207, doc99 },
+  { string100, fn_mapc, 0227, doc100 },
+  { string101, fn_mapl, 0227, doc101 },
+  { string102, fn_mapcar, 0227, doc102 },
+  { string103, fn_mapcan, 0227, doc103 },
+  { string104, fn_maplist, 0227, doc104 },
+  { string105, fn_mapcon, 0227, doc105 },
+  { string106, fn_add, 0207, doc106 },
+  { string107, fn_subtract, 0217, doc107 },
+  { string108, fn_multiply, 0207, doc108 },
+  { string109, fn_divide, 0227, doc109 },
+  { string110, fn_divide, 0212, NULL },
+  { string111, fn_mod, 0222, doc111 },
+  { string112, fn_oneplus, 0211, doc112 },
+  { string113, fn_oneminus, 0211, doc113 },
+  { string114, fn_abs, 0211, doc114 },
+  { string115, fn_random, 0211, doc115 },
+  { string116, fn_maxfn, 0217, doc116 },
+  { string117, fn_minfn, 0217, doc117 },
+  { string118, fn_noteq, 0217, doc118 },
+  { string119, fn_numeq, 0217, doc119 },
+  { string120, fn_less, 0217, doc120 },
+  { string121, fn_lesseq, 0217, doc121 },
+  { string122, fn_greater, 0217, doc122 },
+  { string123, fn_greatereq, 0217, doc123 },
+  { string124, fn_plusp, 0211, doc124 },
+  { string125, fn_minusp, 0211, NULL },
+  { string126, fn_zerop, 0211, doc126 },
+  { string127, fn_oddp, 0211, doc127 },
+  { string128, fn_evenp, 0211, doc128 },
+  { string129, fn_integerp, 0211, doc129 },
+  { string130, fn_integerp, 0211, NULL },
+  { string131, fn_charcode, 0211, doc131 },
+  { string132, fn_codechar, 0211, doc132 },
+  { string133, fn_characterp, 0211, doc133 },
+  { string134, fn_stringp, 0211, doc134 },
+  { string135, fn_stringeq, 0222, doc135 },
+  { string136, fn_stringless, 0222, doc136 },
+  { string137, fn_stringgreater, 0222, doc137 },
+  { string138, fn_stringnoteq, 0222, doc138 },
+  { string139, fn_stringlesseq, 0222, doc139 },
+  { string140, fn_stringgreatereq, 0222, doc140 },
+  { string141, fn_sort, 0222, doc141 },
+  { string142, fn_concatenate, 0217, doc142 },
+  { string143, fn_subseq, 0223, doc143 },
+  { string144, fn_search, 0224, doc144 },
+  { string145, fn_readfromstring, 0211, doc145 },
+  { string146, fn_princtostring, 0211, doc146 },
+  { string147, fn_prin1tostring, 0211, doc147 },
+  { string148, fn_logand, 0207, doc148 },
+  { string149, fn_logior, 0207, doc149 },
+  { string150, fn_logxor, 0207, doc150 },
+  { string151, fn_lognot, 0211, doc151 },
+  { string152, fn_ash, 0222, doc152 },
+  { string153, fn_logbitp, 0222, doc153 },
+  { string154, fn_eval, 0211, doc154 },
+  { string155, fn_return, 0201, doc155 },
+  { string156, fn_globals, 0200, doc156 },
+  { string157, fn_locals, 0200, doc157 },
+  { string158, fn_makunbound, 0211, doc158 },
+  { string159, fn_break, 0200, doc159 },
+  { string160, fn_read, 0201, doc160 },
+  { string161, fn_prin1, 0212, doc161 },
+  { string162, fn_print, 0212, doc162 },
+  { string163, fn_princ, 0212, doc163 },
+  { string164, fn_terpri, 0201, doc164 },
+  { string165, fn_readbyte, 0202, doc165 },
+  { string166, fn_readline, 0201, doc166 },
+  { string167, fn_writebyte, 0212, doc167 },
+  { string168, fn_writestring, 0212, doc168 },
+  { string169, fn_writeline, 0212, doc169 },
+  { string170, fn_restarti2c, 0212, doc170 },
+  { string171, fn_gc, 0200, doc171 },
+  { string172, fn_room, 0200, doc172 },
+  { string173, fn_saveimage, 0201, doc173 },
+  { string174, fn_loadimage, 0201, doc174 },
+  { string175, fn_cls, 0200, doc175 },
+  { string176, fn_digitalread, 0211, doc176 },
+  { string177, fn_analogreadresolution, 0211, doc177 },
+  { string178, fn_analogwrite, 0222, doc178 },
+  { string179, fn_dacreference, 0211, doc179 },
+  { string180, fn_delay, 0211, doc180 },
+  { string181, fn_millis, 0200, doc181 },
+  { string182, fn_sleep, 0201, doc182 },
+  { string183, fn_note, 0203, doc183 },
+  { string184, fn_edit, 0211, doc184 },
+  { string185, fn_pprint, 0212, doc185 },
+  { string186, fn_pprintall, 0201, doc186 },
+  { string187, fn_require, 0211, doc187 },
+  { string188, fn_listlibrary, 0200, doc188 },
+  { string189, sp_help, 0311, doc189 },
+  { string190, fn_documentation, 0212, doc190 },
+  { string191, fn_apropos, 0211, doc191 },
+  { string192, fn_aproposlist, 0211, doc192 },
+  { string193, sp_unwindprotect, 0307, doc193 },
+  { string194, sp_ignoreerrors, 0307, doc194 },
+  { string195, sp_error, 0317, doc195 }, 
   { stringG1, fn_drawpixel, 0223, docG1 },
   { stringG2, fn_drawline, 0245, docG2 },
   { stringG3, fn_drawrect, 0245, docG3 },
@@ -5151,39 +5293,39 @@ const tbl_entry_t lookup_table[] PROGMEM = {
   { stringG18, fn_keyboard, 0211, docG18 },
   { stringG19, (fn_ptr_type)SHIFT_KEY, 0, NULL },
   { stringG20, (fn_ptr_type)META_KEY, 0, NULL },
-  { string185, (fn_ptr_type)LED_BUILTIN, 0, NULL },
-  { string186, (fn_ptr_type)HIGH, DIGITALWRITE, NULL },
-  { string187, (fn_ptr_type)LOW, DIGITALWRITE, NULL },
-  { string188, (fn_ptr_type)INPUT, PINMODE, NULL },
-  { string189, (fn_ptr_type)INPUT_PULLUP, PINMODE, NULL },
-  { string190, (fn_ptr_type)OUTPUT, PINMODE, NULL },
-  { string191, (fn_ptr_type)DEFAULT, ANALOGREFERENCE, NULL },
-  { string192, (fn_ptr_type)VDD, ANALOGREFERENCE, NULL },
-  { string193, (fn_ptr_type)INTERNAL1V024, ANALOGREFERENCE, NULL },
-  { string194, (fn_ptr_type)INTERNAL2V048, ANALOGREFERENCE, NULL },
-  { string195, (fn_ptr_type)INTERNAL4V096, ANALOGREFERENCE, NULL },
-  { string196, (fn_ptr_type)INTERNAL2V5, ANALOGREFERENCE, NULL },
-  { string197, (fn_ptr_type)EXTERNAL, ANALOGREFERENCE, NULL },
-  { string198, (fn_ptr_type)ADC_DAC0, ANALOGREAD, NULL },
-  { string199, (fn_ptr_type)ADC_TEMPERATURE, ANALOGREAD, NULL },
-  { string200, (fn_ptr_type)&PORTA_DIR, REGISTER, NULL },
-  { string201, (fn_ptr_type)&PORTA_OUT, REGISTER, NULL },
-  { string202, (fn_ptr_type)&PORTA_IN, REGISTER, NULL },
-  { string203, (fn_ptr_type)&PORTB_DIR, REGISTER, NULL },
-  { string204, (fn_ptr_type)&PORTB_OUT, REGISTER, NULL },
-  { string205, (fn_ptr_type)&PORTB_IN, REGISTER, NULL },
-  { string206, (fn_ptr_type)&PORTC_DIR, REGISTER, NULL },
-  { string207, (fn_ptr_type)&PORTC_OUT, REGISTER, NULL },
-  { string208, (fn_ptr_type)&PORTC_IN, REGISTER, NULL },
-  { string209, (fn_ptr_type)&PORTD_DIR, REGISTER, NULL },
-  { string210, (fn_ptr_type)&PORTD_OUT, REGISTER, NULL },
-  { string211, (fn_ptr_type)&PORTD_IN, REGISTER, NULL },
-  { string212, (fn_ptr_type)&PORTE_DIR, REGISTER, NULL },
-  { string213, (fn_ptr_type)&PORTE_OUT, REGISTER, NULL },
-  { string214, (fn_ptr_type)&PORTE_IN, REGISTER, NULL },
-  { string215, (fn_ptr_type)&PORTF_DIR, REGISTER, NULL },
-  { string216, (fn_ptr_type)&PORTF_OUT, REGISTER, NULL },
-  { string217, (fn_ptr_type)&PORTF_IN, REGISTER, NULL },
+  { string196, (fn_ptr_type)LED_BUILTIN, 0, NULL },
+  { string197, (fn_ptr_type)HIGH, DIGITALWRITE, NULL },
+  { string198, (fn_ptr_type)LOW, DIGITALWRITE, NULL },
+  { string199, (fn_ptr_type)INPUT, PINMODE, NULL },
+  { string200, (fn_ptr_type)INPUT_PULLUP, PINMODE, NULL },
+  { string201, (fn_ptr_type)OUTPUT, PINMODE, NULL },
+  { string202, (fn_ptr_type)DEFAULT, ANALOGREFERENCE, NULL },
+  { string203, (fn_ptr_type)VDD, ANALOGREFERENCE, NULL },
+  { string204, (fn_ptr_type)INTERNAL1V024, ANALOGREFERENCE, NULL },
+  { string205, (fn_ptr_type)INTERNAL2V048, ANALOGREFERENCE, NULL },
+  { string206, (fn_ptr_type)INTERNAL4V096, ANALOGREFERENCE, NULL },
+  { string207, (fn_ptr_type)INTERNAL2V5, ANALOGREFERENCE, NULL },
+  { string208, (fn_ptr_type)EXTERNAL, ANALOGREFERENCE, NULL },
+  { string209, (fn_ptr_type)ADC_DAC0, ANALOGREAD, NULL },
+  { string210, (fn_ptr_type)ADC_TEMPERATURE, ANALOGREAD, NULL },
+  { string211, (fn_ptr_type)&PORTA_DIR, REGISTER, NULL },
+  { string212, (fn_ptr_type)&PORTA_OUT, REGISTER, NULL },
+  { string213, (fn_ptr_type)&PORTA_IN, REGISTER, NULL },
+  { string214, (fn_ptr_type)&PORTB_DIR, REGISTER, NULL },
+  { string215, (fn_ptr_type)&PORTB_OUT, REGISTER, NULL },
+  { string216, (fn_ptr_type)&PORTB_IN, REGISTER, NULL },
+  { string217, (fn_ptr_type)&PORTC_DIR, REGISTER, NULL },
+  { string218, (fn_ptr_type)&PORTC_OUT, REGISTER, NULL },
+  { string219, (fn_ptr_type)&PORTC_IN, REGISTER, NULL },
+  { string220, (fn_ptr_type)&PORTD_DIR, REGISTER, NULL },
+  { string221, (fn_ptr_type)&PORTD_OUT, REGISTER, NULL },
+  { string222, (fn_ptr_type)&PORTD_IN, REGISTER, NULL },
+  { string223, (fn_ptr_type)&PORTE_DIR, REGISTER, NULL },
+  { string224, (fn_ptr_type)&PORTE_OUT, REGISTER, NULL },
+  { string225, (fn_ptr_type)&PORTE_IN, REGISTER, NULL },
+  { string226, (fn_ptr_type)&PORTF_DIR, REGISTER, NULL },
+  { string227, (fn_ptr_type)&PORTF_OUT, REGISTER, NULL },
+  { string228, (fn_ptr_type)&PORTF_IN, REGISTER, NULL },
 };
 
 #if !defined(extensions)
@@ -5210,8 +5352,8 @@ builtin_t lookupbuiltin (char* c) {
     int entries = tablesize(n);
     end = end + entries;
     for (int i=0; i<entries; i++) {
-      if (strcasecmp_P(c, (char*)pgm_read_ptr(&(table(n)[i].string))) == 0) {
-      return (builtin_t)(start + i); }
+      if (strcasecmp_P(c, (char*)pgm_read_ptr(&(table(n)[i].string))) == 0)
+        return (builtin_t)(start + i);
     }
   }
   return ENDFUNCTIONS;
@@ -5259,12 +5401,19 @@ void testescape () {
   if (tstflag(ESCAPE)) error2(PSTR("escape!"));
 }
 
+bool colonp (symbol_t name) {
+  if (!longnamep(name)) return false;
+  object *form = (object *)name;
+  if (form == NULL) return false;
+  return (((form->chars)>>((sizeof(int)-1)*8) & 0xFF) == ':');
+}
+
 bool keywordp (object *obj) {
   if (!(symbolp(obj) && builtinp(obj->name))) return false;
   builtin_t name = builtin(obj->name);
   int n = name<tablesize(0);
   PGM_P s = (char*)pgm_read_ptr(&table(n?0:1)[n?name:name-tablesize(0)].string);
-  char c = pgm_read_byte(&s[0]);
+  char c = pgm_read_byte(s);
   return (c == ':');
 }
 
@@ -5281,6 +5430,7 @@ object *eval (object *form, object *env) {
   if ((uint16_t)sp - (uint16_t)__bss_end < STACKDIFF) { Context = NIL; error2(PSTR("stack overflow")); }
   if (Freespace <= WORKSPACESIZE>>4) gc(form, env);      // GC when 1/16 of workspace left
   // Escape
+  if (tstflag(ESCAPE)) { clrflag(ESCAPE); error2(PSTR("escape!"));}
   if (!tstflag(NOESC)) testescape();
 
   if (form == NULL) return nil;
@@ -5289,11 +5439,15 @@ object *eval (object *form, object *env) {
 
   if (symbolp(form)) {
     symbol_t name = form->name;
+    if (colonp(name)) return form; // Keyword
     object *pair = value(name, env);
     if (pair != NULL) return cdr(pair);
     pair = value(name, GlobalEnv);
     if (pair != NULL) return cdr(pair);
-    else if (builtinp(name)) return form;
+    else if (builtinp(name)) {
+      if (builtin(name) == FEATURES) return features();
+      return form;
+    }
     Context = NIL;
     error(PSTR("undefined"), form);
   }
@@ -5320,7 +5474,7 @@ object *eval (object *form, object *env) {
       if (!listp(assigns)) error(notalist, assigns);
       object *forms = cdr(args);
       object *newenv = env;
-      push(newenv, GCStack);
+      protect(newenv);
       while (assigns != NULL) {
         object *assign = car(assigns);
         if (!consp(assign)) push(cons(assign,nil), newenv);
@@ -5331,7 +5485,7 @@ object *eval (object *form, object *env) {
         assigns = cdr(assigns);
       }
       env = newenv;
-      pop(GCStack);
+      unprotect();
       form = tf_progn(forms,env);
       TC = TCstart;
       goto EVAL;
@@ -5351,11 +5505,13 @@ object *eval (object *form, object *env) {
 
     if (fntype == SPECIAL_FORMS) {
       Context = name;
+      checkargs(args);
       return ((fn_ptr_type)lookupfn(name))(args, env);
     }
 
     if (fntype == TAIL_FORMS) {
       Context = name;
+      checkargs(args);
       form = ((fn_ptr_type)lookupfn(name))(args, env);
       TC = 1;
       goto EVAL;
@@ -5367,7 +5523,7 @@ object *eval (object *form, object *env) {
   object *fname = car(form);
   int TCstart = TC;
   object *head = cons(eval(fname, env), NULL);
-  push(head, GCStack); // Don't GC the result list
+  protect(head); // Don't GC the result list
   object *tail = head;
   form = cdr(form);
   int nargs = 0;
@@ -5383,13 +5539,13 @@ object *eval (object *form, object *env) {
   function = car(head);
   args = cdr(head);
 
- if (symbolp(function)) {
+  if (symbolp(function)) {
     builtin_t bname = builtin(function->name);
     if (!builtinp(function->name)) error(PSTR("not valid here"), fname);
     Context = bname;
     checkminmax(bname, nargs);
     object *result = ((fn_ptr_type)lookupfn(bname))(args, env);
-    pop(GCStack);
+    unprotect();
     return result;
   }
 
@@ -5399,7 +5555,7 @@ object *eval (object *form, object *env) {
 
     if (isbuiltin(car(function), LAMBDA)) {
       form = closure(TCstart, name, function, args, &env);
-      pop(GCStack);
+      unprotect();
       int trace = tracing(fname->name);
       if (trace) {
         object *result = eval(form, env);
@@ -5418,7 +5574,7 @@ object *eval (object *form, object *env) {
     if (isbuiltin(car(function), CLOSURE)) {
       function = cdr(function);
       form = closure(TCstart, name, function, args, &env);
-      pop(GCStack);
+      unprotect();
       TC = 1;
       goto EVAL;
     }
@@ -5429,7 +5585,7 @@ object *eval (object *form, object *env) {
       if (nargs<n) errorsym2(fname->name, toofewargs);
       if (nargs>n) errorsym2(fname->name, toomanyargs);
       uint32_t entry = startblock(car(function));
-      pop(GCStack);
+      unprotect();
       return call(entry, n, args, env);
     }
     #endif
@@ -5458,11 +5614,7 @@ void pcharacter (uint8_t c, pfun_t pfun) {
     pfun('#'); pfun('\\');
     if (c <= 32) {
       PGM_P p = ControlCodes;
-      #if defined(CPU_ATmega4809)
-      while (c > 0) {p = p + strlen(p) + 1; c--; }
-      #else
       while (c > 0) {p = p + strlen_P(p) + 1; c--; }
-      #endif
       pfstring(p, pfun);
     } else if (c < 127) pfun(c);
     else pint(c, pfun);
@@ -5497,11 +5649,10 @@ void printstring (object *form, pfun_t pfun) {
 }
 
 void pbuiltin (builtin_t name, pfun_t pfun) {
-  int p = 0;
   int n = name<tablesize(0);
   PGM_P s = (char*)pgm_read_ptr(&table(n?0:1)[n?name:name-tablesize(0)].string); 
   while (1) {
-    char c = pgm_read_byte(&s[p++]);
+    char c = pgm_read_byte(s++);
     if (c == 0) return;
     pfun(c);
   }
@@ -5522,7 +5673,7 @@ void printsymbol (object *form, pfun_t pfun) {
 }
 
 void psymbol (symbol_t name, pfun_t pfun) {
-  if ((name & 0x03) == 0) plispstr(name, pfun);
+  if (longnamep(name)) plispstr(name, pfun);
   else {
     uint16_t value = untwist(name);
     if (value < PACKEDS) error2(PSTR("invalid symbol"));
@@ -5532,9 +5683,8 @@ void psymbol (symbol_t name, pfun_t pfun) {
 }
 
 void pfstring (PGM_P s, pfun_t pfun) {
-  int p = 0;
   while (1) {
-    char c = pgm_read_byte(&s[p++]);
+    char c = pgm_read_byte(s++);
     if (c == 0) return;
     pfun(c);
   }
@@ -5642,9 +5792,9 @@ void loadfromlibrary (object *env) {
   GlobalStringIndex = 0;
   object *line = read(glibrary);
   while (line != NULL) {
-    push(line, GCStack);
+    protect(line);
     eval(line, env);
-    pop(GCStack);
+    unprotect();
     line = read(glibrary);
   }
 }
@@ -5703,7 +5853,7 @@ object *nextitem (gfun_t gfun) {
   if (ch == '.') return (object *)DOT;
 
   // Parse string
-  if (ch == '"') return readstring('"', gfun);
+  if (ch == '"') return readstring('"', true, gfun);
 
   // Parse symbol, character, or number
   int index = 0, base = 10, sign = 1;
@@ -5766,13 +5916,8 @@ object *nextitem (gfun_t gfun) {
     if (index == 1) return character(buffer[0]);
     PGM_P p = ControlCodes; char c = 0;
     while (c < 33) {
-      #if defined(CPU_ATmega4809) || defined(CPU_ATtiny3227)
-      if (strcasecmp(buffer, p) == 0) return character(c);
-      p = p + strlen(p) + 1; c++;
-      #else
       if (strcasecmp_P(buffer, p) == 0) return character(c);
       p = p + strlen_P(p) + 1; c++;
-      #endif
     }
     if (index == 3) return character((buffer[0]*10+buffer[1])*10+buffer[2]-5328);
     error2(PSTR("unknown character"));
@@ -6468,6 +6613,7 @@ void initenv () {
   tee = bsymbol(TEE);
 }
 
+// Entry point from the Arduino IDE
 void setup () {
   InitDisplay();
   InitKybd();
@@ -6475,12 +6621,12 @@ void setup () {
   pinMode(8, INPUT_PULLUP); // RX0
   Serial.begin(9600);
   int start = millis();
-  while (millis() - start < 5000) { if (Serial) break; }
+  while ((millis() - start) < 5000) { if (Serial) break; }
   #endif
   initworkspace();
   initenv();
   initsleep();
-  pfstring(PSTR("uLisp 4.4a "), pserial); pln(pserial);
+  pfstring(PSTR("uLisp 4.6 "), pserial); pln(pserial);
 }
 
 // Read/Evaluate/Print loop
@@ -6501,12 +6647,12 @@ void repl (object *env) {
     object *line = read(gserial);
     if (BreakLevel && line == nil) { pln(pserial); return; }
     if (line == (object *)KET) error2(PSTR("unmatched right bracket"));
-    push(line, GCStack);
+    protect(line);
     pfl(pserial);
     line = eval(line, env);
     pfl(pserial);
     printobject(line, pserial);
-    pop(GCStack);
+    unprotect();
     pfl(pserial);
     pln(pserial);
   }
@@ -6521,16 +6667,16 @@ void loop () {
     #endif
     if (autorun == 12) autorunimage();
   }
-  ulispreset();
+  ulisperror();
   repl(NULL);
 }
 
-void ulispreset () {
+void ulisperror () {
   // Come here after error
   #if defined (serialmonitor)
   delay(100); while (Serial.available()) Serial.read();
   #endif
-  clrflag(NOESC); clrflag(ESCAPE); BreakLevel = 0;
+  clrflag(NOESC); BreakLevel = 0;
   for (int i=0; i<TRACEMAX; i++) TraceDepth[i] = 0;
   #if defined(sdcardsupport)
   SDpfile.close(); SDgfile.close();
@@ -6538,5 +6684,4 @@ void ulispreset () {
   #if defined(lisplibrary)
   if (!tstflag(LIBRARYLOADED)) { setflag(LIBRARYLOADED); loadfromlibrary(NULL); clrflag(NOECHO); }
   #endif
-  keyboard(true);
 }
